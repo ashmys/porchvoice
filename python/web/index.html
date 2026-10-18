@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PorchVoice</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="livekit-client.js"></script>
+<script>
+  if (!window.LivekitClient) {
+    document.write('<script src="https://unpkg.com/livekit-client@2.23.0/dist/livekit-client.umd.js"><\/script>');
+  }
+  if (!window.LivekitClient) {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.23.0/dist/livekit-client.umd.js"><\/script>');
+  }
+</script>
+<script defer src="/static/js/core.js"></script>
+<script defer src="/static/js/chat.js"></script>
+<script defer src="/static/js/audio.js"></script>
+<script defer src="/static/js/settings.js"></script>
+<script defer src="/static/js/call.js"></script>
+<script defer src="/static/js/main.js"></script>
+</head>
+<body>
+  <canvas id="stage"></canvas>
+
+  <div id="center">
+    <div id="state">ready</div>
+    <div id="hint">press play, then just talk</div>
+  </div>
+
+  <button id="callbtn" title="Start the call"><svg viewBox="0 0 24 24" width="34" height="34" fill="currentColor" aria-hidden="true"><path d="M8 5.5v13l10.5-6.5z"/></svg></button>
+
+  <div id="micdock">
+    <canvas id="miccanvas"></canvas>
+    <div id="miclabel">MIC</div>
+  </div>
+
+  <div id="side" class="hidden">
+    <div id="sidehead"><span>Conversation</span><span id="histmode" class="histmode" title="Viewing a past conversation - click to return to the live view">history &#10005;</span><button class="clearlog" id="refreshhist" type="button" title="Reload the saved chat log from disk (.jsonl)">refresh</button><button class="clearlog" id="newchat" type="button" title="Start a new conversation (applies to the next call)">new</button><button class="clearlog" id="clearlog" type="button">clear</button></div>
+    <div id="transcript"></div>
+    <form id="chatform">
+      <input id="chatinput" type="text" placeholder="Type a message (optional)..." autocomplete="off">
+      <button id="sendbtn" type="submit">Send</button>
+    </form>
+  </div>
+
+  <button id="sidetab" type="button" title="Show / hide conversation" aria-expanded="false">
+    <span class="ic-open">&#128172;</span><span class="ic-close">&times;</span>
+  </button>
+
+  <div class="corner">
+    <button class="iconbtn" id="histbtn" title="Chat history">&#128337;</button>
+    <button class="iconbtn" id="gearbtn" title="Settings">&#9881;</button>
+  </div>
+
+  <div class="modal" id="settingsheet">
+    <div class="modalbox">
+      <div class="modalhead">
+        <h2>Settings</h2>
+        <div class="tabbar">
+          <button class="tab active" data-tab="tabconn" type="button">Connection</button>
+          <button class="tab" data-tab="tabspeech" type="button">Speech</button>
+          <button class="tab" data-tab="tabbehav" type="button">Behavior</button>
+          <button class="tab" data-tab="tabadv" type="button">Advanced</button>
+        </div>
+        <button class="closebtn" id="closegear">&times;</button>
+      </div>
+      <div class="modalbody">
+        <div class="tabpage active" id="tabconn">
+          <div class="sect">LiveKit</div>
+          <div class="field"><label>LiveKit URL</label><input type="text" id="cfg-LIVEKIT_URL" placeholder="ws://127.0.0.1:7880"></div>
+          <div class="grid2">
+            <div class="field"><label>LiveKit API key</label><input type="text" id="cfg-LIVEKIT_API_KEY"></div>
+            <div class="field"><label>LiveKit API secret</label><input type="password" id="cfg-LIVEKIT_API_SECRET"></div>
+          </div>
+          <div class="sect">Publish mode (applies after a restart)</div>
+          <div class="field"><label>Who can reach this assistant</label>
+            <select id="cfg-PUBLISH_MODE">
+              <option value="local">local - this computer only (default)</option>
+              <option value="wifi">wifi - share on your local network</option>
+              <option value="public">public - quick tunnel via cloudflared</option>
+            </select>
+            <div class="hint">public mode starts a free trycloudflare.com quick tunnel; remote browsers reach LiveKit through this server's /lk WebSocket proxy. Audio for far-away listeners also needs UDP 50000-50100 forwarded (or a TURN server).</div>
+          </div>
+          <div class="field"><label>Publish status</label>
+            <div class="pubbox" id="pubbox">local - http://127.0.0.1:8090</div>
+          </div>
+          <div class="sect">Microphone (browser capture)</div>
+          <div class="field"><label>Input device (applies to the next call)</label>
+            <select id="micdevice"><option value="">System default</option></select>
+          </div>
+          <div class="sect">Language model (OpenAI-compatible)</div>
+          <div class="field">
+            <label>Provider profile <button type="button" class="minibtn" id="profsave" title="Store the current URL / key / model under this name">save</button> <button type="button" class="minibtn" id="profdelete" title="Delete this profile">delete</button></label>
+            <input type="text" id="profilename" list="profilelist" placeholder="Type or pick a profile (e.g. OpenRouter free, Local Llama...)">
+            <datalist id="profilelist"></datalist>
+            <div class="hint">Pick a profile to load its URL / key / model instantly. Changes to the base URL, API key or model name below save automatically - both to the app settings and to the active profile. "save" stores the current settings as a profile; "delete" removes the active one.</div>
+          </div>
+          <div class="field"><label>API base URL (empty = auto-detect local first)</label>
+            <input type="text" id="cfg-LLM_BASE_URL" placeholder="http://127.0.0.1:11434/v1">
+            <div class="hint">http:// counts as a local provider, https:// as cloud. Empty auto-detects Ollama :11434/v1, LM Studio :1234/v1, llama.cpp :8080/v1, textgen :5000/v1 in that order, then falls back to OpenAI when a key is set.<br>Local: Ollama :11434/v1 &middot; LM Studio :1234/v1 &middot; llama.cpp :8080/v1<br>Cloud: https://api.openai.com/v1 &middot; https://api.groq.com/openai/v1 &middot; https://openrouter.ai/api/v1</div>
+          </div>
+          <div class="grid2">
+            <div class="field"><label>API key (optional everywhere)</label><input type="password" id="cfg-LLM_API_KEY" placeholder="empty for local servers"></div>
+            <div class="field"><label>Model name (manual)</label><input type="text" id="cfg-LLM_MODEL" placeholder="llama3, gpt-4o-mini, ..."></div>
+          </div>
+          <div class="field"><label>Model picker <button type="button" class="minibtn" id="refreshmodels">refresh</button></label>
+            <select id="llmmodels"><option value="">Loading model list...</option></select>
+            <div class="hint" id="modelhint">Loads the model list from your provider. Picking one fills the model name above; you can also type any model id manually.</div>
+          </div>
+          <div class="field"><label>Compatibility mode (for servers that reject tools)</label>
+            <select id="cfg-LLM_COMPAT_MODE"><option value="0">Off (default - function tools / MCP enabled)</option><option value="1">On (minimal requests, no tool calling)</option></select>
+            <div class="hint">Some minimal local servers reject the tools parameter. Compatibility mode uses a minimal payload but MCP tools and built-in tools will not fire in that mode.</div>
+          </div>
+          <div class="field"><label>Token streaming</label>
+            <select id="cfg-LLM_STREAMING"><option value="0">Full reply first (stable)</option><option value="1">Stream tokens (live text)</option></select>
+          </div>
+          <div class="field"><label>Thinking mode</label>
+            <select id="cfg-LLM_THINKING"><option value="0">Off (default)</option><option value="1">On (show the model's thinking)</option></select>
+            <div class="hint">When on, &lt;think&gt;...&lt;/think&gt; blocks and reasoning tokens are captured and shown as a collapsible "thinking" block in the conversation instead of being read aloud. Applies to the next conversation.</div>
+          </div>
+          <div class="field"><label>Speak the thinking out loud</label>
+            <select id="cfg-LLM_SPEAK_THINKING"><option value="0">No (default - keep it silent)</option><option value="1">Yes (read the thinking before the answer)</option></select>
+            <div class="hint">Only used when thinking mode is on. Off keeps the thinking text silent and on-screen only.</div>
+          </div>
+          <div class="sect">MCP tools (one server URL)</div>
+          <div class="field"><label>MCP URL</label>
+            <input type="text" id="cfg-MCP_URL" placeholder="http://127.0.0.1:9800/mcp">
+            <div class="hint">A single MCP server URL. URLs ending in /mcp use streamable HTTP, everything else uses SSE. The agent attaches every tool the server exposes and reports calls in the conversation panel.</div>
+          </div>
+          <div class="grid2">
+            <div class="field"><label>Bearer token (optional)</label><input type="password" id="cfg-MCP_AUTH_TOKEN" placeholder="empty = no auth"></div>
+            <div class="field"><label>Timeout (seconds)</label><input type="text" id="cfg-MCP_TIMEOUT" placeholder="5"></div>
+          </div>
+          <div class="field"><label>MCP status <button type="button" class="minibtn" id="mcptest">test connection</button></label>
+            <div class="pubbox" id="mcpbox">not configured</div>
+          </div>
+        </div>
+
+        <div class="tabpage" id="tabspeech">
+          <div class="sect">Remote STT server (optional)</div>
+          <div class="field"><label>Whisper-compatible transcriptions URL</label>
+            <input type="text" id="cfg-STT_BASE_URL" placeholder="http://127.0.0.1:9000/v1 (empty = embedded local Whisper)">
+            <div class="hint">Expects POST {url}/audio/transcriptions (whisper.cpp server, faster-whisper-server, Groq, OpenAI). http:// = local, https:// = cloud. Empty keeps the embedded faster-whisper engine.</div>
+          </div>
+          <div class="grid2">
+            <div class="field"><label>STT API key (optional)</label><input type="password" id="cfg-STT_API_KEY" placeholder="empty = none"></div>
+            <div class="field"><label>STT model</label><input type="text" id="cfg-STT_MODEL" placeholder="whisper-1"></div>
+          </div>
+          <div class="sect">Speech-to-text</div>
+          <div class="field"><label>Whisper model</label><select id="cfg-WHISPER_MODEL"></select></div>
+          <div class="grid2">
+            <div class="field"><label>Device</label>
+              <select id="cfg-WHISPER_DEVICE"><option value="auto">Auto</option><option value="cuda">GPU (CUDA)</option><option value="cpu">CPU</option></select>
+            </div>
+            <div class="field"><label>Compute</label>
+              <select id="cfg-WHISPER_COMPUTE"><option value="auto">Auto</option><option value="float16">float16</option><option value="int8">int8</option></select>
+            </div>
+          </div>
+          <div class="grid2">
+            <div class="field"><label>Language (auto = detect)</label>
+              <select id="cfg-WHISPER_LANGUAGE">
+                <option value="auto">auto</option><option value="en">en</option><option value="id">id</option>
+                <option value="ja">ja</option><option value="zh">zh</option><option value="ko">ko</option>
+                <option value="es">es</option><option value="fr">fr</option><option value="de">de</option>
+                <option value="pt">pt</option><option value="ru">ru</option><option value="ar">ar</option>
+                <option value="hi">hi</option>
+              </select>
+              <div class="hint">Auto-detect often misfires on short sentences - pick your language explicitly for a big accuracy boost.</div>
+            </div>
+            <div class="field"><label>Beam width</label>
+              <select id="cfg-WHISPER_BEAM"><option value="1">1 (fast)</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="5">5 (slow)</option></select>
+            </div>
+          </div>
+          <div class="field"><label>Initial prompt (bias names &amp; jargon)</label>
+            <input type="text" id="cfg-WHISPER_INITIAL_PROMPT" placeholder="e.g. Kira, LiveKit, OpenRouter, Blender, Jakarta">
+            <div class="hint">Whisper hears what it expects. List names, apps or domain words you say often (comma separated) so they are transcribed correctly. Applies to the next conversation.</div>
+          </div>
+          <div class="grid3">
+            <div class="field"><label>Temperature</label><input type="text" id="cfg-WHISPER_TEMPERATURE" inputmode="decimal" placeholder="0.0"></div>
+            <div class="field"><label>Min logprob</label><input type="text" id="cfg-WHISPER_MIN_LOGPROB" inputmode="decimal" placeholder="-1.0"></div>
+            <div class="field"><label>Max compratio</label><input type="text" id="cfg-WHISPER_MAX_COMPRATIO" inputmode="decimal" placeholder="2.4"></div>
+          </div>
+          <div class="field"><label>VAD filter (skips silence)</label>
+            <select id="cfg-WHISPER_VAD_FILTER"><option value="1">On (recommended)</option><option value="0">Off</option></select>
+          </div>
+          <div class="sect">Microphone capture processing</div>
+          <div class="grid3">
+            <div class="field"><label>Echo cancel</label>
+              <select id="cfg-CAP_ECHO_CANCEL"><option value="1">On</option><option value="0">Off</option></select>
+            </div>
+            <div class="field"><label>Noise suppress</label>
+              <select id="cfg-CAP_NOISE_SUPPRESS"><option value="1">On</option><option value="0">Off</option></select>
+            </div>
+            <div class="field"><label>Auto gain</label>
+              <select id="cfg-CAP_AUTO_GAIN"><option value="1">On</option><option value="0">Off</option></select>
+            </div>
+          </div>
+          <div class="hint">Still inaccurate with every model size? The browser's noise suppression and auto-gain can mangle speech before Whisper sees it. Try <b>Noise suppress = Off</b> (and Auto gain = Off) - applies to the next call. Keep Echo cancel On unless you use headphones.</div>
+          <div class="sect">Remote TTS server (optional)</div>
+          <div class="field"><label>OpenAI-compatible speech URL</label>
+            <input type="text" id="cfg-TTS_BASE_URL" placeholder="http://127.0.0.1:8000/v1 (empty = embedded local Piper)">
+            <div class="hint">Expects POST {url}/audio/speech (openedai-speech, piper wrappers, OpenAI). http:// = local, https:// = cloud. Empty keeps the embedded Piper engine.</div>
+          </div>
+          <div class="grid2">
+            <div class="field"><label>TTS API key (optional)</label><input type="password" id="cfg-TTS_API_KEY" placeholder="empty = none"></div>
+            <div class="field"><label>TTS model</label><input type="text" id="cfg-TTS_MODEL" placeholder="tts-1"></div>
+          </div>
+          <div class="sect">Text-to-speech</div>
+          <div class="field"><label>Piper voice</label><select id="cfg-TTS_VOICE"></select></div>
+          <div class="field"><label>TTS speed <span class="rangeval" id="val-TTS_SPEED"></span></label>
+            <input type="range" id="cfg-TTS_SPEED" min="0.7" max="1.6" step="0.05">
+          </div>
+        </div>
+
+        <div class="tabpage" id="tabbehav">
+          <div class="sect">Turn taking</div>
+          <div class="field"><label>End-of-sentence pause (s) <span class="rangeval" id="val-ENDPOINTING_DELAY"></span></label>
+            <input type="range" id="cfg-ENDPOINTING_DELAY" min="0.3" max="2" step="0.05">
+          </div>
+          <div class="grid2">
+            <div class="field"><label>Min silence (s) <span class="rangeval" id="val-VAD_MIN_SILENCE"></span></label>
+              <input type="range" id="cfg-VAD_MIN_SILENCE" min="0.2" max="1.5" step="0.05">
+            </div>
+            <div class="field"><label>VAD threshold <span class="rangeval" id="val-VAD_ACTIVATION_THRESHOLD"></span></label>
+              <input type="range" id="cfg-VAD_ACTIVATION_THRESHOLD" min="0.2" max="0.8" step="0.05">
+            </div>
+          </div>
+          <div class="sect">Echo guard</div>
+          <div class="field"><label>Echo guard</label>
+            <select id="cfg-ECHO_GUARD"><option value="1">On (drops mic echo of the assistant)</option><option value="0">Off</option></select>
+          </div>
+          <div class="field"><label>Echo guard tail (s) <span class="rangeval" id="val-ECHO_GUARD_TAIL"></span></label>
+            <input type="range" id="cfg-ECHO_GUARD_TAIL" min="0" max="3" step="0.1">
+          </div>
+        </div>
+
+        <div class="tabpage" id="tabadv">
+          <div class="sect">Desktop app window</div>
+          <div class="field"><label>Browser for the app window</label>
+            <select id="cfg-UI_BROWSER"><option value="">System default (auto)</option></select>
+            <div class="hint">"System default" uses the browser Windows opens links with (Brave, Chrome, Edge, ...). Pick another installed browser to force it. Firefox opens a normal window (no app mode). Applies on the next start of start.bat.</div>
+          </div>
+          <div class="field"><label>Browser profile for the app window</label>
+            <select id="cfg-UI_PROFILE"><option value="1">Separate profile (recommended)</option><option value="0">My normal browser profile</option></select>
+            <div class="hint">A separate profile keeps the app window its own browser instance: instant close detection, and closing the terminal closes the window too. Mic permission is asked once inside that profile.</div>
+          </div>
+          <div class="sect">Advanced</div>
+          <div class="field"><label>Restart everything</label>
+            <button id="restartbtn" type="button">Restart LiveKit + agent</button>
+            <div class="hint">Stops and restarts the LiveKit server and the agent worker with the current saved settings. Useful after a config change that does not want to apply, or if a service looks stuck. The conversation panel stays open.</div>
+          </div>
+          <div class="field"><label>Log level (needs agent restart)</label>
+            <select id="cfg-LOG_LEVEL"><option value="DEBUG">DEBUG</option><option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select>
+          </div>
+        </div>
+      </div>
+      <div class="savebar">
+        <button id="savebtn">Save changes</button>
+        <div id="savemsg"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="histsheet">
+    <div class="modalbox">
+      <div class="modalhead"><h2>Chat history</h2><button class="closebtn" id="closehist">&times;</button></div>
+      <div class="modalbody" id="histbody"></div>
+    </div>
+  </div>
+
+  <div class="modal" id="clearsheet">
+    <div class="modalbox small">
+      <div class="modalhead"><h2>Clear conversation?</h2><button class="closebtn" id="clearno">&times;</button></div>
+      <div class="modalbody">
+        <p id="cleartext">This empties the conversation panel, erases this conversation's saved messages (this room's chat log file) and resets the model's memory of the conversation. This cannot be undone.</p>
+      </div>
+      <div class="savebar btnrow">
+        <button id="clearno2" class="halfbtn" type="button">Cancel</button>
+        <button id="clearyes" class="dangerbtn" type="button">Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="restartsheet">
+    <div class="modalbox small">
+      <div class="modalhead"><h2>Restart everything?</h2><button class="closebtn" id="restartno">&times;</button></div>
+      <div class="modalbody">
+        <p id="restarttext">The LiveKit server and the agent worker will stop and start again with your saved settings. This takes a few seconds (models reload). Any ongoing call ends.</p>
+      </div>
+      <div class="savebar btnrow">
+        <button id="restartno2" class="halfbtn" type="button">Cancel</button>
+        <button id="restartyes" class="dangerbtn" type="button">Restart</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="status">
+    <div id="strow">
+      <span id="stdot"></span>
+      <span id="stword">starting</span>
+      <span id="stmic"></span>
+    </div>
+    <div id="stchips">checking services...</div>
+  </div>
+  <div id="toast"></div>
+</body>
+</html>
