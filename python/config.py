@@ -30,6 +30,9 @@ CONFIG_DEFAULTS = {
     "STT_API_KEY": "",
     "STT_MODEL": "whisper-1",
     "STT_ENGINE": "",
+    "STT_GGUF_SERVER": "",
+    "STT_GGUF_PORT": "8900",
+    "STT_GGUF_MODEL": "Qwen3-ASR-0.6B-Q8_0.gguf",
     "WHISPER_MODEL": "small",
     "WHISPER_DEVICE": "auto",
     "WHISPER_COMPUTE": "auto",
@@ -85,6 +88,8 @@ HEAVY_KEYS = (
     "STT_ENGINE",
     "TTS_ENGINE",
     "KOKORO_VOICE",
+    "STT_GGUF_SERVER",
+    "STT_GGUF_MODEL",
 )
 
 LOCAL_LLM_CANDIDATES = (
@@ -114,7 +119,9 @@ def load_config() -> dict:
                     continue
                 k, _, v = line.partition("=")
                 k = k.strip()
-                cfg[k] = v.strip()
+                v = v.strip()
+                if v:
+                    cfg[k] = v
     except FileNotFoundError:
         pass
     for k in list(cfg):
@@ -228,6 +235,14 @@ def resolve_llm(cfg: dict, probe=None) -> dict:
     }
 
 
+def gguf_stt_url(cfg: dict) -> str:
+    base = (cfg.get("STT_GGUF_SERVER", "") or "").strip()
+    if base:
+        return base.rstrip("/")
+    port = _num(cfg, "STT_GGUF_PORT", "8900", int)
+    return f"http://127.0.0.1:{port}/v1"
+
+
 def resolve_stt(cfg: dict) -> dict:
     base = (cfg.get("STT_BASE_URL", "") or "").strip()
     key = (cfg.get("STT_API_KEY", "") or "").strip()
@@ -235,6 +250,14 @@ def resolve_stt(cfg: dict) -> dict:
     model = (cfg.get("STT_MODEL", "") or "whisper-1").strip()
     if engine == "whisper":
         base = ""
+    if engine == "gguf":
+        gguf_model = (cfg.get("STT_GGUF_MODEL", "") or "qwen3-asr").strip()
+        return {
+            "base_url": gguf_stt_url(cfg), "api_key": key,
+            "model": gguf_model, "engine": "gguf",
+            "kind": "local",
+            "source": "config" if cfg.get("STT_GGUF_SERVER", "").strip() else "auto",
+        }
     if base:
         return {
             "base_url": base.rstrip("/"), "api_key": key,

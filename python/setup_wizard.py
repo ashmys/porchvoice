@@ -21,10 +21,11 @@ YAML_FILE = USER_DATA / "livekit.yaml"
 WHISPER_BASE = USER_DATA / "models" / "whisper"
 PIPER_BASE = USER_DATA / "models" / "piper"
 KOKORO_BASE = USER_DATA / "models" / "kokoro"
+GGUF_ASR_BASE = USER_DATA / "models" / "gguf-asr"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from keyvault import SECRET_KEYS, encrypt_value
+from keyvault import SECRET_KEYS, decrypt_value, encrypt_value
 
 DRY_RUN = False
 AUTO = False
@@ -118,8 +119,8 @@ def write_env(updates: dict) -> None:
         if cfg.get(k) and not str(cfg[k]).startswith("enc:v1:"):
             cfg[k] = encrypt_value(str(cfg[k]))
     lines = [
-        "PorchVoice settings",
-        "Edit in a text editor, or use the web UI gear icon.",
+        "# PorchVoice settings",
+        "# Edit in a text editor, or use the web UI gear icon.",
         "",
         "# ---- LiveKit server (must match livekit.yaml keys) ----",
         f"LIVEKIT_URL={cfg.get('LIVEKIT_URL', 'ws://127.0.0.1:7880')}",
@@ -138,12 +139,18 @@ def write_env(updates: dict) -> None:
         f"LLM_COMPAT_MODE={cfg.get('LLM_COMPAT_MODE', '0')}",
         f"LLM_STREAMING={cfg.get('LLM_STREAMING', '1')}",
         "",
-        "# ---- STT engine: empty = auto (remote if URL set), whisper = embedded, remote = server ----",
+        "# ---- STT engine: empty = auto (remote if URL set), whisper = embedded, gguf = Qwen3-ASR GGUF, remote = server ----",
         f"STT_ENGINE={cfg.get('STT_ENGINE', '')}",
         "# ---- STT: remote Whisper-compatible server (optional) ----",
         f"STT_BASE_URL={cfg.get('STT_BASE_URL', '')}",
         f"STT_API_KEY={cfg.get('STT_API_KEY', '')}",
         f"STT_MODEL={cfg.get('STT_MODEL', 'whisper-1')}",
+        "",
+        "# ---- STT: GGUF ASR via llama.cpp (STT_ENGINE=gguf) ----",
+        "# Empty STT_GGUF_SERVER = PorchVoice runs its own llama-server child",
+        f"STT_GGUF_SERVER={cfg.get('STT_GGUF_SERVER', '')}",
+        f"STT_GGUF_PORT={cfg.get('STT_GGUF_PORT', '8900')}",
+        f"STT_GGUF_MODEL={cfg.get('STT_GGUF_MODEL', 'Qwen3-ASR-0.6B-Q8_0.gguf')}",
         "",
         "# ---- TTS engine: kokoro (default) | piper | remote ----",
         f"TTS_ENGINE={cfg.get('TTS_ENGINE', 'kokoro')}",
@@ -184,6 +191,17 @@ def write_livekit_yaml() -> None:
     if DRY_RUN:
         print(f"(dry-run) would write {YAML_FILE}")
         return
+    cfg = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                cfg[k.strip()] = v.strip()
+    key = cfg.get("LIVEKIT_API_KEY", "devkey") or "devkey"
+    secret = cfg.get("LIVEKIT_API_SECRET", "") or "porchvoice-secret-1234567890abcdef"
+    if secret.startswith("enc:v1:"):
+        secret = decrypt_value(secret) or "porchvoice-secret-1234567890abcdef"
     YAML_FILE.parent.mkdir(parents=True, exist_ok=True)
     YAML_FILE.write_text(
         "port: 7880\n"
@@ -197,7 +215,7 @@ def write_livekit_yaml() -> None:
         "  use_external_ip: false\n"
         "\n"
         "keys:\n"
-        "  devkey: porchvoice-secret-1234567890abcdef\n",
+        f"  {key}: {secret}\n",
         encoding="utf-8",
     )
     print(f"saved {YAML_FILE}")
@@ -622,6 +640,118 @@ def step_voice() -> None:
         step_piper()
 
 
+GGUF_ASR_BASE_URL = "https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/main"
+GGUF_ASR_FILES = ("Qwen3-ASR-0.6B-Q8_0.gguf", "mmproj-Qwen3-ASR-0.6B-Q8_0.gguf")
+LLAMA_RELEASE_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+
+
+def latest_llama_assets() -> tuple:
+    req = urllib.request.Request(LLAMA_RELEASE_API,
+                                 headers={"User-Agent": "voice-kit-setup/1"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.load(r)
+    return data.get("tag_name", ""), [a.get("name", "") for a in data.get("assets", [])]
+
+
+def pick_llama_assets(assets: list) -> list:
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "windows":
+        for key in ("-bin-win-cuda-", "-bin-win-vulkan-", "-bin-win-cpu-"):
+            main = next((n for n in assets if n.startswith("llama-") and key in n
+                         and n.endswith("x64.zip")), "")
+            if main:
+                extras = ([n for n in assets if n.startswith("cudart-")
+                           and key in n and n.endswith(".zip")]
+                          if "cuda" in key else [])
+                return [main] + extras
+    elif system == "darwin":
+        arch = "arm64" if machine in ("arm64", "aarch64") else "x64"
+        main = next((n for n in assets if n.startswith("llama-")
+                     and f"-bin-macos-{arch}" in n and n.endswith(".zip")), "")
+        return [main] if main else []
+    else:
+        main = next((n for n in assets if n.startswith("llama-")
+                     and "-bin-ubuntu-x64" in n and n.endswith(".zip")), "")
+        return [main] if main else []
+    return []
+
+
+def download_llama_server() -> bool:
+    exe_name = "llama-server.exe" if os.name == "nt" else "llama-server"
+    if (BIN_DIR / exe_name).is_file() or shutil.which("llama-server"):
+        return True
+    if DRY_RUN:
+        print("(dry-run) llama-server download skipped")
+        return True
+    print("  Fetching the latest llama.cpp release (llama-server)...")
+    try:
+        tag, assets = latest_llama_assets()
+    except Exception as exc:
+        print(f"  could not query llama.cpp releases ({exc})")
+        print("  Download llama-server manually from "
+              "https://github.com/ggml-org/llama.cpp/releases and put it in bin/")
+        return False
+    names = pick_llama_assets(assets)
+    if not names:
+        print("  no matching llama.cpp asset for this platform - download it "
+              "manually from https://github.com/ggml-org/llama.cpp/releases")
+        return False
+    for name in names:
+        url = f"https://github.com/ggml-org/llama.cpp/releases/download/{tag}/{name}"
+        dest = BIN_DIR / name
+        download_resumable(url, dest, name, min_bytes=1_000_000)
+        with zipfile.ZipFile(dest) as z:
+            z.extractall(BIN_DIR)
+        dest.unlink(missing_ok=True)
+    if not (BIN_DIR / exe_name).is_file():
+        for p in BIN_DIR.rglob(exe_name):
+            p.replace(BIN_DIR / exe_name)
+            break
+    if (BIN_DIR / exe_name).is_file():
+        print(f"  extracted -> {BIN_DIR / exe_name}")
+        return True
+    print(f"  {exe_name} not found after extraction - check bin/ manually")
+    return False
+
+
+def step_gguf_asr(default_yes: str = "y") -> None:
+    hr("STEP 7] GGUF ASR - Qwen3-ASR 0.6B via llama.cpp (speech-to-text)")
+    print("  Speech-to-text with the Qwen3-ASR-0.6B GGUF model (~1 GB total).")
+    print("  PorchVoice starts a local llama-server child automatically and")
+    print("  transcribes through its OpenAI-compatible /v1/audio/transcriptions.")
+    model_ok = all((GGUF_ASR_BASE / f).is_file() for f in GGUF_ASR_FILES)
+    exe_name = "llama-server.exe" if os.name == "nt" else "llama-server"
+    bin_ok = (BIN_DIR / exe_name).is_file() or bool(shutil.which("llama-server"))
+    print(f"  model files : {'present' if model_ok else 'missing'} ({GGUF_ASR_BASE})")
+    print(f"  llama-server: {'present' if bin_ok else 'missing'} (bin/{exe_name})")
+    if not model_ok:
+        if ask("Download the Qwen3-ASR GGUF model? (Y/n)", default_yes).strip().lower() in \
+                ("", "y", "yes"):
+            if DRY_RUN:
+                print("(dry-run) GGUF model download skipped")
+            else:
+                for fname in GGUF_ASR_FILES:
+                    url = f"{GGUF_ASR_BASE_URL}/{fname}"
+                    min_bytes = 50_000_000 if fname.startswith("mmproj") else 500_000_000
+                    download_resumable(url, GGUF_ASR_BASE / fname, fname,
+                                       min_bytes=min_bytes)
+                model_ok = all((GGUF_ASR_BASE / f).is_file() for f in GGUF_ASR_FILES)
+    if model_ok and not bin_ok:
+        if ask("Download the llama.cpp llama-server binary? (Y/n)", default_yes).strip().lower() in \
+                ("", "y", "yes"):
+            bin_ok = download_llama_server()
+    if model_ok and bin_ok:
+        if ask("Enable GGUF ASR now (STT_ENGINE=gguf)? (Y/n)", "y").strip().lower() in \
+                ("", "y", "yes"):
+            write_env({"STT_ENGINE": "gguf"})
+            print("  PorchVoice will start llama-server with Qwen3-ASR on next launch.")
+    else:
+        print("  GGUF ASR not fully set up - the embedded Whisper engine stays active.")
+        print("  You can retry later (setup menu 7) or point STT_GGUF_SERVER at an")
+        print("  existing llama-server in the web UI settings.")
+
+
 def done() -> None:
     hr("ALL DONE")
     if os.name == "nt":
@@ -635,6 +765,7 @@ def run_all() -> None:
     step_deps(); step_livekit()
     mode = step_config()
     step_whisper_prefetch(); step_voice()
+    step_gguf_asr(default_yes="n")
     if mode == "public":
         step_cloudflared()
     else:
@@ -667,6 +798,7 @@ def main() -> None:
         print("  4) Whisper STT model")
         print("  5) Voice engine (Kokoro / Piper TTS)")
         print("  6) cloudflared (only for public publish mode)")
+        print("  7) GGUF ASR (Qwen3-ASR 0.6B speech-to-text via llama.cpp)")
         print("  0) Run ALL steps, then exit")
         choice = ask("Choose", "0")
         if DRY_RUN and AUTO:
@@ -684,6 +816,8 @@ def main() -> None:
             step_voice()
         elif choice == "6":
             step_cloudflared()
+        elif choice == "7":
+            step_gguf_asr()
         elif choice == "0":
             run_all()
             return

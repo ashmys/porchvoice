@@ -46,6 +46,14 @@ def section_config() -> None:
     check("classify http->local", config.classify_endpoint("http://x/v1") == "local")
     check("classify https->cloud", config.classify_endpoint("https://x/v1") == "cloud")
 
+    cfg = {"STT_ENGINE": "gguf"}
+    sel = config.resolve_stt(cfg)
+    check("stt gguf auto url", sel["engine"] == "gguf"
+          and sel["base_url"] == "http://127.0.0.1:8900/v1", str(sel))
+    cfg = {"STT_ENGINE": "gguf", "STT_GGUF_SERVER": "http://127.0.0.1:9999/v1"}
+    sel = config.resolve_stt(cfg)
+    check("stt gguf explicit server", sel["base_url"].endswith(":9999/v1"), str(sel))
+
     cfg = {"LLM_BASE_URL": "https://api.groq.com/openai/v1", "LLM_API_KEY": "k"}
     sel = config.resolve_llm(cfg)
     check("llm explicit cloud", sel["kind"] == "cloud" and sel["base_url"].startswith("https://"))
@@ -129,6 +137,42 @@ def section_providers() -> None:
                                "TTS_API_KEY": "k", "TTS_MODEL": "tts-1",
                                "TTS_VOICE": "alloy", "TTS_SPEED": "1.0"})
     check("remote TTS builds", type(tts).__name__ == "RemoteTTS")
+
+
+def section_env_file() -> None:
+    print("[1d] env file: empty values keep defaults, junk lines repaired")
+    import config
+    import server as srv
+    import tempfile
+
+    old_env = config.ENV_FILE
+    old_srv_env = srv.ENV_FILE
+    tmp = Path(tempfile.mkdtemp()) / ".env.local"
+    try:
+        tmp.write_text(
+            "PorchVoice settings\n"
+            "Applies to the NEXT conversation.\n"
+            "LIVEKIT_API_SECRET=\n"
+            "LLM_BASE_URL=http://127.0.0.1:1234/v1\n",
+            encoding="utf-8")
+        config.ENV_FILE = tmp
+        srv.ENV_FILE = tmp
+        cfg = config.load_config()
+        check("empty LIVEKIT_API_SECRET keeps default",
+              cfg.get("LIVEKIT_API_SECRET") == config.CONFIG_DEFAULTS["LIVEKIT_API_SECRET"],
+              str(cfg.get("LIVEKIT_API_SECRET")))
+        check("non-empty value still applies",
+              cfg.get("LLM_BASE_URL") == "http://127.0.0.1:1234/v1")
+        srv.repair_env_file()
+        repaired = tmp.read_text(encoding="utf-8")
+        check("junk header lines commented out",
+              repaired.startswith("# PorchVoice settings\n# Applies"), repaired[:80])
+        check("KEY=value lines untouched", "LIVEKIT_API_SECRET=\n" in repaired)
+    finally:
+        config.ENV_FILE = old_env
+        srv.ENV_FILE = old_srv_env
+        tmp.unlink(missing_ok=True)
+        tmp.parent.rmdir()
 
 
 def section_keyvault() -> None:
@@ -312,6 +356,24 @@ async def section_config_api() -> None:
                     stored = line.partition("=")[2]
             check("sentinel did not clobber key",
                   keyvault.decrypt_value(stored) == "sk-or-v1-plain-key-xyz")
+            raw_env = srv.ENV_FILE.read_text(encoding="utf-8")
+            check("env header lines are comments",
+                  raw_env.startswith("# "), raw_env[:40])
+            async with aiohttp.ClientSession() as s:
+                async with s.post(base + "/api/config", json={
+                        "config": {"LIVEKIT_API_SECRET": "",
+                                   "LIVEKIT_API_KEY": "",
+                                   "STT_ENGINE": "gguf"}}) as r:
+                    check("empty default-backed keys skipped",
+                          r.status == 200, str(r.status))
+            raw_env = srv.ENV_FILE.read_text(encoding="utf-8")
+            empty_lk = [l for l in raw_env.splitlines()
+                        if l.startswith(("LIVEKIT_API_SECRET=", "LIVEKIT_API_KEY="))]
+            check("no empty LIVEKIT key/secret lines", not empty_lk, str(empty_lk))
+            check("STT_ENGINE=gguf stored", "STT_ENGINE=gguf" in raw_env)
+            check("config post keeps defaults effective",
+                  config.load_config().get("LIVEKIT_API_SECRET")
+                  == config.CONFIG_DEFAULTS["LIVEKIT_API_SECRET"])
             cfg = config.load_config()
             check("load_config decrypts transparently", cfg.get("LLM_API_KEY") == "sk-or-v1-plain-key-xyz")
             async with aiohttp.ClientSession() as s:
@@ -355,6 +417,8 @@ def section_worker_boot() -> None:
         proc.kill()
         out, _ = proc.communicate()
     check("worker ran preflight", "PREFLIGHT" in out, out[-400:])
+    check("worker preflight resolves LiveKit credentials",
+          "LiveKit API key/secret missing" not in out, out[-400:])
     check("no import crash in worker", "Traceback" not in out
           or "Connection" in out or "connection" in out, out[-400:])
 
@@ -436,6 +500,7 @@ async def main_async() -> None:
     section_config()
     section_keyvault()
     friendly_llm_error_cases()
+    section_env_file()
     section_providers()
     await section_server()
     await section_config_api()

@@ -75,6 +75,7 @@ CONFIG_FALLBACK = {
 from config import (
     HEAVY_KEYS,
     load_config,
+    masked,
     resolve_mcp,
     safe_room_name,
 )
@@ -705,6 +706,16 @@ def preflight() -> None:
     logger.info("-" * 60)
     logger.info("PREFLIGHT: checking dependencies...")
 
+    lk_key = (cfg.get("LIVEKIT_API_KEY", "") or "").strip()
+    lk_secret = (cfg.get("LIVEKIT_API_SECRET", "") or "").strip()
+    if lk_key and lk_secret:
+        logger.info("PREFLIGHT: LiveKit credentials OK (key %s)",
+                    masked(lk_key))
+    else:
+        logger.error("PREFLIGHT: LiveKit API key/secret missing - defaults "
+                     "apply automatically; set LIVEKIT_API_KEY/LIVEKIT_API_SECRET "
+                     "in user_data/.env.local to override.")
+
     lk = cfg.get("LIVEKIT_URL", "ws://127.0.0.1:7880")
     target = re.sub(r"^wss?://", "", lk).split("/")[0]
     host, _, port = target.partition(":")
@@ -740,10 +751,19 @@ def preflight() -> None:
 
 if __name__ == "__main__":
     try:
+        boot_cfg = load_config()
         preflight()
         prewarm_models()
         agents.cli.run_app(
-            agents.WorkerOptions(entrypoint_fnc=entrypoint)
+            agents.WorkerOptions(
+                entrypoint_fnc=entrypoint,
+                ws_url=(boot_cfg.get("LIVEKIT_URL", "")
+                        or "ws://127.0.0.1:7880").strip(),
+                api_key=(boot_cfg.get("LIVEKIT_API_KEY", "")
+                         or "devkey").strip(),
+                api_secret=(boot_cfg.get("LIVEKIT_API_SECRET", "")
+                            or "porchvoice-secret-1234567890abcdef").strip(),
+            )
         )
     except KeyboardInterrupt:
         sys.exit(0)

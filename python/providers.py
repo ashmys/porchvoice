@@ -44,9 +44,11 @@ def build_stt(cfg: dict):
     from config import resolve_stt
 
     sel = resolve_stt(cfg)
-    if sel["engine"] == "remote" and sel["base_url"]:
+    if sel["engine"] in ("remote", "gguf") and sel["base_url"]:
         from remote_stt import create_remote_stt
 
+        if sel["engine"] == "gguf":
+            _wait_gguf_server(sel["base_url"])
         return create_remote_stt(
             base_url=sel["base_url"], api_key=sel["api_key"],
             model=sel["model"], language=cfg.get("WHISPER_LANGUAGE", "en"),
@@ -65,6 +67,43 @@ def build_stt(cfg: dict):
         max_compratio=float(str(cfg.get("WHISPER_MAX_COMPRATIO", "2.4") or 2.4)),
         initial_prompt=cfg.get("WHISPER_INITIAL_PROMPT", ""),
     )
+
+
+def _health_urls(base_url: str) -> list:
+    base = base_url.rstrip("/")
+    root = base[:-3] if base.endswith("/v1") else base
+    urls = [root + "/health"]
+    if root != base:
+        urls.append(base + "/health")
+    return urls
+
+
+def _wait_gguf_server(base_url: str, timeout: float = 20.0) -> None:
+    import time
+    import urllib.error
+    import urllib.request
+
+    logger.info("GGUF STT: waiting for the ASR server at %s ...", base_url)
+    urls = _health_urls(base_url)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for url in urls:
+            try:
+                with urllib.request.urlopen(url, timeout=2) as r:
+                    if r.status == 200:
+                        logger.info("GGUF STT server is ready at %s", base_url)
+                        return
+            except urllib.error.HTTPError as e:
+                if e.code != 503:
+                    logger.info("GGUF STT server is up at %s (HTTP %s on %s)",
+                                base_url, e.code, url)
+                    return
+            except Exception:
+                pass
+        time.sleep(0.5)
+    logger.warning("GGUF STT server not ready at %s after %.0fs - the first "
+                   "utterance may fail if it never comes up. Check the "
+                   "supervisor log for the stt-gguf child.", base_url, timeout)
 
 
 def build_tts(cfg: dict):

@@ -150,9 +150,23 @@
             <select id="cfg-STT_ENGINE">
               <option value="">Auto (remote server if a URL is set, else embedded Whisper)</option>
               <option value="whisper">Embedded Whisper (ignore the URL below)</option>
+              <option value="gguf">GGUF - Qwen3-ASR 0.6B via llama.cpp (local)</option>
               <option value="remote">Remote server (OpenAI-compatible)</option>
             </select>
-            <div class="hint">Embedded Whisper runs offline on this machine. Remote mode works with any whisper-compatible server: whisper.cpp, faster-whisper-server, Groq, OpenAI, speech-to-text providers that expose POST {url}/audio/transcriptions.</div>
+            <div class="hint">Embedded Whisper runs offline on this machine. GGUF mode runs Qwen3-ASR 0.6B (set up via setup step 7) on a local llama-server that PorchVoice starts for you. Remote mode works with any whisper-compatible server: whisper.cpp, faster-whisper-server, Groq, OpenAI, speech-to-text providers that expose POST {url}/audio/transcriptions.</div>
+          </div>
+          <div class="sect">GGUF ASR (Qwen3-ASR via llama.cpp)</div>
+          <div class="grid2">
+            <div class="field"><label>GGUF ASR server URL (optional)</label>
+              <input type="text" id="cfg-STT_GGUF_SERVER" placeholder="empty = PorchVoice runs its own llama-server">
+              <div class="hint">Leave empty to let PorchVoice start llama-server with Qwen3-ASR (port below). Or point it at an existing llama-server, e.g. http://127.0.0.1:8900/v1</div>
+            </div>
+            <div class="field"><label>GGUF ASR port</label>
+              <input type="text" id="cfg-STT_GGUF_PORT" placeholder="8900">
+            </div>
+          </div>
+          <div class="field"><label>GGUF ASR status</label>
+            <div class="pubbox" id="ggufbox">model files: unknown - run setup step 7</div>
           </div>
           <div class="sect">Remote STT server (optional)</div>
           <div class="field"><label>Whisper-compatible transcriptions URL</label>

@@ -303,6 +303,7 @@ async function loadConfigForm() {
   ]);
   const cfg = cfgR.config || {};
   fillBrowserPicker(cfg);
+  renderGgufBox(sttR && sttR.gguf);
   for (const [k, el] of Object.entries(cfgEls())) {
     if (cfg[k] !== undefined && cfg[k] !== "") {
       if (el.tagName === "SELECT") ensureOpt(el, cfg[k]);
@@ -449,6 +450,18 @@ async function refreshMcpStatus() {
 }
 $("mcptest").addEventListener("click", refreshMcpStatus);
 
+function renderGgufBox(gg) {
+  const box = $("ggufbox");
+  if (!box) return;
+  if (!gg) { box.textContent = "status unavailable"; return; }
+  const files = gg.ready
+    ? "model files ready (" + gg.model + ")"
+    : "model files MISSING (run setup step 7)";
+  const bin = gg.binary ? "llama-server found" : "llama-server not found";
+  const mode = gg.engine === "gguf" ? "SELECTED as STT engine" : "not selected";
+  box.textContent = files + " \u00b7 " + bin + " \u00b7 " + mode + " \u00b7 " + gg.server;
+}
+
 async function refreshProviderStatus() {
   const box = $("providerbox");
   if (!box) return;
@@ -464,6 +477,9 @@ async function refreshProviderStatus() {
     parts.push("stt " + (stt.status === "up" ? "up (" + stt.detail + ")"
                           : stt.status === "down" ? "DOWN - " + stt.detail
                           : stt.status + " (" + stt.detail + ")"));
+    if (stt.engine === "gguf" && stt.status === "down") {
+      parts.push("gguf hint: run setup step 7 or set STT_GGUF_SERVER");
+    }
     const tts = c.tts || {};
     parts.push("tts " + (tts.status === "up" ? "up (" + tts.detail + ")"
                           : tts.status === "down" ? "DOWN - " + tts.detail

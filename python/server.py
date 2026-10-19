@@ -36,7 +36,9 @@ AGENT_SCRIPT = Path(__file__).resolve().parent / "agent.py"
 WINDOW_STATE_FILE = ROOT / "user_data" / "window_state.json"
 
 from config import (
+    CONFIG_DEFAULTS,
     detect_lan_ip,
+    gguf_stt_url,
     load_config,
     masked,
     publish_mode,
@@ -49,6 +51,19 @@ from keyvault import SECRET_KEYS, encrypt_value, is_encrypted
 from mcp_client import probe_mcp
 
 SECRET_SENTINEL = "__saved__"
+
+GGUF_ASR_DIR = ROOT / "user_data" / "models" / "gguf-asr"
+LLAMA_SERVER_EXE = ROOT / "bin" / ("llama-server.exe" if os.name == "nt"
+                                   else "llama-server")
+
+RESTART_MAX_CRASHES = 5
+FATAL_MARKERS = (
+    "api_secret is required",
+    "api_key is required",
+    "ws_url is required",
+    "could not parse config",
+    "invalid api key",
+)
 
 
 HB_INTERVAL = 2.5
@@ -131,6 +146,8 @@ TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.IGNOREC
 
 CHILDREN = {}
 _RESTART = {}
+_CRASHES = {}
+_SPAWNED_AT = {}
 _OUT = {}
 _BROWSER = None
 _BROWSER_JOBBED = False
@@ -160,6 +177,32 @@ def env_dict() -> dict:
     except FileNotFoundError:
         pass
     return cfg
+
+
+def repair_env_file() -> None:
+    if not ENV_FILE.is_file():
+        return
+    try:
+        lines = ENV_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        log(f"could not read {ENV_FILE.name} for repair ({exc})")
+        return
+    fixed = False
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" not in stripped:
+            line = "# " + stripped
+            fixed = True
+        out.append(line)
+    if not fixed:
+        return
+    try:
+        ENV_FILE.write_text("\n".join(out) + "\n", encoding="utf-8")
+        log(f"repaired {ENV_FILE.name}: commented out line(s) that are not "
+            "KEY=value (they made python-dotenv warn on every start)")
+    except OSError as exc:
+        log(f"could not rewrite {ENV_FILE.name} ({exc})")
 
 
 def mask_secrets(cfg: dict) -> dict:
@@ -268,7 +311,6 @@ def assign_job(proc) -> None:
 def spawn(name: str, argv: list) -> None:
     log(f"[{name}] starting: {' '.join(str(a) for a in argv)}")
 
-
     child_env = dict(os.environ)
     child_env.setdefault("PYTHONIOENCODING", "utf-8")
     child_env.setdefault("PYTHONUTF8", "1")
@@ -293,6 +335,7 @@ def spawn(name: str, argv: list) -> None:
         return
     CHILDREN[name] = proc
     _OUT[name] = deque(maxlen=80)
+    _SPAWNED_AT[name] = _monotonic()
     assign_job(proc)
 
     def pump() -> None:
@@ -309,15 +352,37 @@ def spawn(name: str, argv: list) -> None:
         code = proc.wait()
         print(f"[  sup] [{name}] exited with code {code}", flush=True)
         CHILDREN.pop(name, None)
+        runtime = _monotonic() - _SPAWNED_AT.get(name, _monotonic())
         if name == "lk" and code != 0 and child_saw(name, "could not parse config"):
             heal_yaml()
             _RESTART[name] = 1
-        if _RESTART.get(name):
-            delay = _RESTART[name]
-            _RESTART[name] = min(delay * 2, 30)
-            log(f"[{name}] restarting in {delay}s...")
-            time.sleep(delay)
-            spawn(name, argv)
+        if not _RESTART.get(name):
+            return
+        fatal = next((m for m in FATAL_MARKERS if child_saw(name, m)), None)
+        if fatal:
+            _RESTART.pop(name, None)
+            log(f"[{name}] stopped retrying: the last run failed with a fatal "
+                f"config error ({fatal!r}) - restarting cannot fix this")
+            log(f"[{name}] FIX -> correct the setting in user_data/.env.local "
+                "or the web UI, then press Settings -> Restart (or POST /api/restart)")
+            return
+        if runtime < 15.0:
+            _CRASHES[name] = _CRASHES.get(name, 0) + 1
+        else:
+            _CRASHES[name] = 0
+        if _CRASHES.get(name, 0) >= RESTART_MAX_CRASHES:
+            _RESTART.pop(name, None)
+            _CRASHES[name] = 0
+            log(f"[{name}] gave up after {RESTART_MAX_CRASHES} fast crashes in "
+                "a row - it keeps dying right after start")
+            log(f"[{name}] FIX -> read the error above, correct the config, "
+                "then press Settings -> Restart (or POST /api/restart) to try again")
+            return
+        delay = _RESTART[name]
+        _RESTART[name] = min(delay * 2, 30)
+        log(f"[{name}] restarting in {delay}s...")
+        time.sleep(delay)
+        spawn(name, argv)
 
     threading.Thread(target=watch, daemon=True, name=f"{name}-watch").start()
 
@@ -372,6 +437,48 @@ def find_cloudflared() -> str:
         return str(CLOUDFLARED_EXE)
     found = shutil.which("cloudflared")
     return found or ""
+
+
+def find_llama_server() -> str:
+    if LLAMA_SERVER_EXE.is_file():
+        return str(LLAMA_SERVER_EXE)
+    found = shutil.which("llama-server")
+    return found or ""
+
+
+def gguf_asr_files() -> tuple:
+    model = mmproj = None
+    if GGUF_ASR_DIR.is_dir():
+        for f in sorted(GGUF_ASR_DIR.glob("*.gguf")):
+            if f.name.lower().startswith("mmproj"):
+                if mmproj is None:
+                    mmproj = f
+            elif model is None:
+                model = f
+    return model, mmproj
+
+
+def stt_gguf_cmd() -> tuple:
+    cfg = load_config()
+    if (cfg.get("STT_ENGINE", "") or "").strip().lower() != "gguf":
+        return None, "STT_ENGINE is not gguf"
+    base = (cfg.get("STT_GGUF_SERVER", "") or "").strip()
+    if base:
+        return None, "STT_GGUF_SERVER is set - using the external server"
+    exe = find_llama_server()
+    if not exe:
+        return None, ("llama-server binary not found (bin/llama-server or PATH) - "
+                      "run setup step 7, or set STT_GGUF_SERVER to an existing "
+                      "llama-server URL")
+    model, mmproj = gguf_asr_files()
+    if model is None or mmproj is None:
+        return None, ("Qwen3-ASR GGUF files missing in user_data/models/gguf-asr "
+                      "(need the main model + mmproj-*.gguf) - run setup step 7")
+    port = int(str(cfg.get("STT_GGUF_PORT", "8900") or 8900))
+    argv = [exe, "-m", str(model), "--mmproj", str(mmproj),
+            "--host", "127.0.0.1", "--port", str(port),
+            "--ctx-size", "4096", "-ngl", "99", "--no-webui"]
+    return argv, ""
 
 
 def current_mode() -> str:
@@ -455,6 +562,7 @@ def tunnel_info() -> dict:
 def stop_children() -> None:
     stop_tunnel()
     _RESTART.clear()
+    _CRASHES.clear()
     procs = list(CHILDREN.items())
     if _BROWSER is not None:
         procs.append(("ui-browser", _BROWSER))
@@ -515,6 +623,14 @@ def banner() -> None:
     lib = WEB_DIR / "livekit-client.js"
     pub = tunnel_info()
     mcp_sel = resolve_mcp(load_config())
+    cfg = load_config()
+    stt_sel = resolve_stt(cfg)
+    tts_sel = resolve_tts(cfg)
+    if stt_sel["base_url"]:
+        stt_line = f"{stt_sel['engine']} ({stt_sel['base_url']})"
+    else:
+        stt_line = (f"{stt_sel['engine']} (embedded whisper, model "
+                    f"{cfg.get('WHISPER_MODEL', 'small')})")
     log("=" * 68)
     log("PORCHVOICE - a local-first voice assistant")
     log(f"publish mode   : {pub['mode']}")
@@ -524,6 +640,8 @@ def banner() -> None:
     log(f"python         : {platform.python_version()}  pid: {os.getpid()}")
     log(f"LiveKit        : ws://{lk_host}:{lk_port} -> {'UP' if up else 'DOWN'}")
     log(f"LLM API        : {check_llm()}")
+    log(f"STT            : {stt_line}")
+    log(f"TTS            : {tts_sel['engine']}")
     log(f"MCP            : {mcp_sel['url'] or 'not configured'}"
         + (" (bearer set)" if mcp_sel.get("token") else ""))
     log(f"GPU (nvidia)   : {check_gpu()}")
@@ -562,7 +680,19 @@ def list_stt_models() -> dict:
     for name, mb in WHISPER_SIZES_MB.items():
         downloaded = bool(local_model_dir(name))
         presets.append({"name": name, "size_mb": mb, "local": downloaded})
-    return {"presets": presets, "local_folders": local}
+    cfg = load_config()
+    model, mmproj = gguf_asr_files()
+    gguf = {
+        "dir": str(GGUF_ASR_DIR),
+        "model": model.name if model else "",
+        "mmproj": mmproj.name if mmproj else "",
+        "ready": bool(model and mmproj),
+        "binary": find_llama_server(),
+        "server": (cfg.get("STT_GGUF_SERVER", "") or "").strip()
+                  or f"http://127.0.0.1:{cfg.get('STT_GGUF_PORT', '8900')}/v1",
+        "engine": (cfg.get("STT_ENGINE", "") or "").strip().lower(),
+    }
+    return {"presets": presets, "local_folders": local, "gguf": gguf}
 
 
 def local_model_dir(name: str):
@@ -724,6 +854,7 @@ async def api_config_post(request: web.Request) -> web.Response:
         "LLM_COMPAT_MODE", "LLM_STREAMING",
         "LLM_THINKING", "LLM_SPEAK_THINKING",
         "STT_BASE_URL", "STT_API_KEY", "STT_MODEL", "STT_ENGINE",
+        "STT_GGUF_SERVER", "STT_GGUF_PORT", "STT_GGUF_MODEL",
         "TTS_BASE_URL", "TTS_API_KEY", "TTS_MODEL",
         "TTS_ENGINE", "TTS_VOICE", "TTS_SPEED", "KOKORO_VOICE",
         "MCP_URL", "MCP_AUTH_TOKEN", "MCP_TIMEOUT",
@@ -743,11 +874,13 @@ async def api_config_post(request: web.Request) -> web.Response:
         v = v.strip()
         if k in SECRET_KEYS and v == SECRET_SENTINEL:
             continue
+        if not v and str(CONFIG_DEFAULTS.get(k, "") or ""):
+            continue
         if k in SECRET_KEYS and v and not is_encrypted(v):
             v = encrypt_value(v)
         current[k] = v
-    lines = ["PorchVoice settings (saved from the web UI)",
-             "Applies to the NEXT conversation after you click Save."]
+    lines = ["# PorchVoice settings (saved from the web UI)",
+             "# Applies to the NEXT conversation after you click Save."]
     for k, v in sorted(current.items()):
         lines.append(f"{k}={v}")
     try:
@@ -807,9 +940,9 @@ def probe_provider(base_url: str, key: str, timeout: float = 5.0) -> dict:
 
 def check_stt_provider(cfg: dict) -> dict:
     sel = resolve_stt(cfg)
-    if sel["engine"] == "remote" and sel["base_url"]:
+    if sel["engine"] in ("remote", "gguf") and sel["base_url"]:
         state = probe_provider(sel["base_url"], sel["api_key"])
-        state["engine"] = "remote"
+        state["engine"] = sel["engine"]
         state["url"] = sel["base_url"]
         return state
     models = list_stt_models()
@@ -889,6 +1022,7 @@ async def api_restart(_request: web.Request) -> web.Response:
         return web.json_response({"error": "nothing is running"}, status=409)
     names = list(CHILDREN.keys())
     for name in names:
+        _CRASHES.pop(name, None)
         _RESTART[name] = 1
         try:
             CHILDREN[name].terminate()
@@ -1749,6 +1883,53 @@ def build_app() -> web.Application:
     return app
 
 
+def prepare_livekit_yaml() -> None:
+    mode = current_mode()
+    try:
+        LIVEKIT_YAML.parent.mkdir(parents=True, exist_ok=True)
+        expected_bind = "127.0.0.1" if mode == "local" else "0.0.0.0"
+        existing = LIVEKIT_YAML.read_text(encoding="utf-8") if LIVEKIT_YAML.exists() else ""
+        key = setting("LIVEKIT_API_KEY", "devkey") or "devkey"
+        secret = (setting("LIVEKIT_API_SECRET", "")
+                  or "porchvoice-secret-1234567890abcdef")
+        keys_ok = f"{key}: {secret}" in existing
+        bind_ok = f"- {expected_bind}" in existing
+        if not existing or not bind_ok:
+            LIVEKIT_YAML.write_text(minimal_yaml(mode), encoding="utf-8")
+            log(f"wrote livekit.yaml for {mode} mode (bind {expected_bind}, "
+                f"key {masked(key)})")
+        elif not keys_ok:
+            backup = LIVEKIT_YAML.with_name("livekit.yaml.old-keys")
+            try:
+                shutil.copyfile(LIVEKIT_YAML, backup)
+                log("livekit.yaml keys did not match LIVEKIT_API_KEY/SECRET "
+                    f"- rewrote it (old file saved as {backup.name})")
+            except OSError:
+                log("livekit.yaml keys did not match LIVEKIT_API_KEY/SECRET "
+                    "- rewrote it")
+            LIVEKIT_YAML.write_text(minimal_yaml(mode), encoding="utf-8")
+            log(f"livekit.yaml now uses key {masked(key)} from user_data/.env.local")
+    except OSError as exc:
+        log(f"could not prepare livekit.yaml ({exc})")
+
+
+def start_gguf_stt() -> None:
+    argv, why = stt_gguf_cmd()
+    if argv is None:
+        cfg = load_config()
+        if (cfg.get("STT_ENGINE", "") or "").strip().lower() == "gguf":
+            log(f"[stt-gguf] not started: {why}")
+            log("[stt-gguf] FIX -> run setup step 7 (GGUF ASR), or point "
+                "STT_GGUF_SERVER at a running llama-server, or pick another "
+                "STT engine in Settings")
+        return
+    _RESTART["stt-gguf"] = 3
+    spawn("stt-gguf", argv)
+    url = gguf_stt_url(load_config())
+    log(f"[stt-gguf] Qwen3-ASR GGUF server will answer at {url} "
+        "(/v1/audio/transcriptions)")
+
+
 def main() -> None:
     global JOB, _K32
     _harden_streams()
@@ -1760,19 +1941,11 @@ def main() -> None:
     if not (WEB_DIR / "index.html").is_file():
         log("WARNING: python/web/index.html missing - UI will 404")
 
+    repair_env_file()
+    prepare_livekit_yaml()
+
     JOB = setup_job_object()
     _K32 = ctypes.WinDLL("kernel32", use_last_error=True) if os.name == "nt" else None
-
-    mode = current_mode()
-    try:
-        LIVEKIT_YAML.parent.mkdir(parents=True, exist_ok=True)
-        expected_bind = "127.0.0.1" if mode == "local" else "0.0.0.0"
-        existing = LIVEKIT_YAML.read_text(encoding="utf-8") if LIVEKIT_YAML.exists() else ""
-        if not existing or f"- {expected_bind}" not in existing:
-            LIVEKIT_YAML.write_text(minimal_yaml(mode), encoding="utf-8")
-            log(f"wrote livekit.yaml for {mode} mode (bind {expected_bind})")
-    except OSError as exc:
-        log(f"could not prepare livekit.yaml ({exc})")
 
     agent_python = venv_python() if venv_python().exists() else Path(sys.executable)
     _RESTART["lk"] = 3
@@ -1782,8 +1955,10 @@ def main() -> None:
     else:
         log("bin/livekit-server missing - run setup.sh (or setup.bat)")
     spawn("agent", [agent_python, "-u", AGENT_SCRIPT, "start"])
+    threading.Thread(target=start_gguf_stt, daemon=True,
+                     name="gguf-starter").start()
 
-    if mode == "public":
+    if current_mode() == "public":
         threading.Thread(target=start_quick_tunnel, daemon=True,
                          name="tunnel-starter").start()
 
