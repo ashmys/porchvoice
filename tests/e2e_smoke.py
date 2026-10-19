@@ -131,6 +131,33 @@ def section_providers() -> None:
     check("remote TTS builds", type(tts).__name__ == "RemoteTTS")
 
 
+def section_keyvault() -> None:
+    print("[1b] keyvault at-rest encryption")
+    import keyvault
+
+    plain = "sk-or-v1-abc123secret"
+    enc = keyvault.encrypt_value(plain)
+    check("encrypt wraps with prefix", enc.startswith("enc:v1:") and plain not in enc)
+    check("decrypt roundtrip", keyvault.decrypt_value(enc) == plain)
+    check("plaintext passthrough", keyvault.decrypt_value(plain) == plain)
+    check("empty passthrough", keyvault.encrypt_value("") == "")
+    tampered = enc[:-4] + ("AAAA" if enc[-4:] != "AAAA" else "BBBB")
+    check("tamper detected", keyvault.decrypt_value(tampered) == "")
+    check("secret keys list", "LLM_API_KEY" in keyvault.SECRET_KEYS)
+
+
+def friendly_llm_error_cases() -> None:
+    print("[1c] friendly LLM error mapping")
+    import agent
+
+    check("401 -> key hint", "API key" in agent.friendly_llm_error("Error code: 401 - Invalid API key"))
+    check("402 -> usage limit hint", "usage limit" in agent.friendly_llm_error("HTTP 402 Insufficient Credits"))
+    check("429 -> rate limit hint", "rate limit" in agent.friendly_llm_error("Rate limit exceeded: free-models-per-day"))
+    check("conn refused -> reachability hint",
+          "Cannot reach" in agent.friendly_llm_error("Connection refused by provider"))
+    check("unknown passthrough", "weird failure" in agent.friendly_llm_error("weird failure"))
+
+
 async def _boot_app(mode: str, port: int, tunnel_host: str = "") -> web.AppRunner:
     import server as srv
 
@@ -242,6 +269,67 @@ async def _fake_livekit_upstream() -> web.AppRunner:
     return runner
 
 
+async def section_config_api() -> None:
+    print("[3b] config API: secrets encrypted at rest, masked responses")
+    import config
+    import server as srv
+    import keyvault
+
+    backup = None
+    if srv.ENV_FILE.exists():
+        backup = srv.ENV_FILE.read_bytes()
+    try:
+        runner = await _boot_app("local", free_port())
+        base = "http://127.0.0.1:" + str(runner.addresses[0][1])
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.post(base + "/api/config", json={
+                        "config": {"LLM_API_KEY": "sk-or-v1-plain-key-xyz",
+                                   "LLM_BASE_URL": "https://openrouter.ai/api/v1"}}) as r:
+                    d = await r.json()
+                    check("config post ok", r.status == 200 and d.get("ok"), str(d))
+                    check("config post masks key in response",
+                          d["config"]["LLM_API_KEY"] == srv.SECRET_SENTINEL, str(d["config"]["LLM_API_KEY"]))
+            raw = srv.ENV_FILE.read_text(encoding="utf-8")
+            check("key encrypted at rest", "enc:v1:" in raw and "sk-or-v1-plain-key-xyz" not in raw)
+            async with aiohttp.ClientSession() as s:
+                async with s.get(base + "/api/config") as r:
+                    d = await r.json()
+                    check("config get masks key",
+                          d["config"]["LLM_API_KEY"] == srv.SECRET_SENTINEL)
+                async with s.post(base + "/api/reveal", json={"key": "LLM_API_KEY"}) as r:
+                    d = await r.json()
+                    check("reveal returns plaintext", d.get("value") == "sk-or-v1-plain-key-xyz", str(d))
+                async with s.post(base + "/api/reveal", json={"key": "NOT_A_SECRET"}) as r:
+                    check("reveal rejects unknown key", r.status == 400)
+                async with s.post(base + "/api/config", json={
+                        "config": {"LLM_API_KEY": srv.SECRET_SENTINEL,
+                                   "LLM_BASE_URL": "https://openrouter.ai/api/v1"}}) as r:
+                    check("sentinel keeps stored key", r.status == 200)
+            stored = ""
+            for line in srv.ENV_FILE.read_text(encoding="utf-8").splitlines():
+                if line.startswith("LLM_API_KEY="):
+                    stored = line.partition("=")[2]
+            check("sentinel did not clobber key",
+                  keyvault.decrypt_value(stored) == "sk-or-v1-plain-key-xyz")
+            cfg = config.load_config()
+            check("load_config decrypts transparently", cfg.get("LLM_API_KEY") == "sk-or-v1-plain-key-xyz")
+            async with aiohttp.ClientSession() as s:
+                async with s.get(base + "/api/check") as r:
+                    d = await r.json()
+                    check("api/check has stt/tts sections",
+                          "stt" in d and "tts" in d, str(list(d)))
+                    check("api/check llm status string", "llm" in d and isinstance(d["llm"]["status"], str))
+                    check("api/check tts engine detected", d["tts"].get("engine") in ("kokoro", "piper"), str(d["tts"]))
+        finally:
+            await runner.cleanup()
+    finally:
+        if backup is not None:
+            srv.ENV_FILE.write_bytes(backup)
+        elif srv.ENV_FILE.exists():
+            srv.ENV_FILE.unlink()
+
+
 def section_worker_boot() -> None:
     print("[4] agent worker boot (dry-run against a dead LiveKit port)")
     py = str(ROOT / ".venv" / "bin" / "python")
@@ -346,8 +434,11 @@ async def main_async() -> None:
     global LK_PORT
     LK_PORT = free_port()
     section_config()
+    section_keyvault()
+    friendly_llm_error_cases()
     section_providers()
     await section_server()
+    await section_config_api()
     await section_mcp_live()
     section_worker_boot()
 

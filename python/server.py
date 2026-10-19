@@ -42,8 +42,13 @@ from config import (
     publish_mode,
     resolve_llm,
     resolve_mcp,
+    resolve_stt,
+    resolve_tts,
 )
+from keyvault import SECRET_KEYS, encrypt_value, is_encrypted
 from mcp_client import probe_mcp
+
+SECRET_SENTINEL = "__saved__"
 
 
 HB_INTERVAL = 2.5
@@ -155,6 +160,14 @@ def env_dict() -> dict:
     except FileNotFoundError:
         pass
     return cfg
+
+
+def mask_secrets(cfg: dict) -> dict:
+    out = dict(cfg)
+    for k in SECRET_KEYS:
+        if out.get(k):
+            out[k] = SECRET_SENTINEL
+    return out
 
 
 def setting(key: str, default: str = "") -> str:
@@ -485,19 +498,10 @@ def check_llm() -> str:
     sel = resolve_llm(load_config())
     if sel["kind"] == "none":
         return "not configured (set LLM_BASE_URL or LLM_API_KEY)"
-    import urllib.request as _u
-
-    headers = {"Authorization": "Bearer " + sel["api_key"]} if sel["api_key"] else {}
-    try:
-        req = _u.Request(sel["base_url"].rstrip("/") + "/models", headers=headers)
-        with _u.urlopen(req, timeout=4) as r:
-            return f"up ({sel['kind']}, HTTP {r.status})"
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return "auth failed (check the API key)"
-        return f"down (HTTP {e.code})"
-    except Exception:
-        return f"down ({sel['kind']} endpoint unreachable)"
+    state = probe_provider(sel["base_url"], sel["api_key"], timeout=4)
+    if state["status"] == "up":
+        return f"up ({sel['kind']}, HTTP {state['code']})"
+    return f"down ({state['detail']})"
 
 
 def banner() -> None:
@@ -567,6 +571,8 @@ def local_model_dir(name: str):
 
 
 def list_tts_models() -> dict:
+    from local_kokoro import VOICE_PRESETS, kokoro_ready
+
     voices = []
     base = piper_dir()
     if base.is_dir():
@@ -579,7 +585,8 @@ def list_tts_models() -> dict:
     for s in suggestions:
         if all(v["name"] != s for v in voices):
             voices.append({"name": s, "local": False})
-    return {"voices": voices}
+    return {"voices": voices, "kokoro_voices": list(VOICE_PRESETS),
+            "kokoro_ready": kokoro_ready()}
 
 
 def parse_room_from_history(path: Path) -> str:
@@ -650,7 +657,7 @@ async def api_chat_session(request: web.Request) -> web.Response:
                 except ValueError:
                     continue
                 who = rec.get("who")
-                if who in ("user", "bot") and rec.get("text"):
+                if who in ("user", "bot", "error") and rec.get("text"):
                     msgs.append({
                         "who": who, "text": rec["text"],
                         "ts": rec.get("ts", ""), "id": rec.get("id", ""),
@@ -695,7 +702,8 @@ async def api_chat_clear(request: web.Request) -> web.Response:
 
 
 async def api_config_get(_request: web.Request) -> web.Response:
-    return web.json_response({"config": env_dict()})
+    return web.json_response({"config": mask_secrets(env_dict()),
+                              "secret_keys": list(SECRET_KEYS)})
 
 
 async def api_config_post(request: web.Request) -> web.Response:
@@ -715,15 +723,16 @@ async def api_config_post(request: web.Request) -> web.Response:
         "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
         "LLM_COMPAT_MODE", "LLM_STREAMING",
         "LLM_THINKING", "LLM_SPEAK_THINKING",
-        "STT_BASE_URL", "STT_API_KEY", "STT_MODEL",
+        "STT_BASE_URL", "STT_API_KEY", "STT_MODEL", "STT_ENGINE",
         "TTS_BASE_URL", "TTS_API_KEY", "TTS_MODEL",
+        "TTS_ENGINE", "TTS_VOICE", "TTS_SPEED", "KOKORO_VOICE",
         "MCP_URL", "MCP_AUTH_TOKEN", "MCP_TIMEOUT",
         "WHISPER_MODEL", "WHISPER_DEVICE", "WHISPER_COMPUTE", "WHISPER_LANGUAGE",
         "WHISPER_BEAM", "WHISPER_VAD_FILTER", "WHISPER_TEMPERATURE",
         "WHISPER_MIN_LOGPROB", "WHISPER_MAX_COMPRATIO",
         "WHISPER_INITIAL_PROMPT",
         "CAP_ECHO_CANCEL", "CAP_NOISE_SUPPRESS", "CAP_AUTO_GAIN",
-        "TTS_VOICE", "TTS_SPEED", "VAD_MIN_SILENCE", "VAD_ACTIVATION_THRESHOLD",
+        "VAD_MIN_SILENCE", "VAD_ACTIVATION_THRESHOLD",
         "ENDPOINTING_DELAY", "ECHO_GUARD", "ECHO_GUARD_TAIL", "LOG_LEVEL",
         "AUTO_OPEN", "UI_WINDOW", "CLOSE_WITH_WINDOW",
         "UI_BROWSER", "UI_PROFILE",
@@ -731,7 +740,12 @@ async def api_config_post(request: web.Request) -> web.Response:
     for k, v in updates.items():
         if k not in allowed or not isinstance(v, str):
             continue
-        current[k] = v.strip()
+        v = v.strip()
+        if k in SECRET_KEYS and v == SECRET_SENTINEL:
+            continue
+        if k in SECRET_KEYS and v and not is_encrypted(v):
+            v = encrypt_value(v)
+        current[k] = v
     lines = ["PorchVoice settings (saved from the web UI)",
              "Applies to the NEXT conversation after you click Save."]
     for k, v in sorted(current.items()):
@@ -744,7 +758,21 @@ async def api_config_post(request: web.Request) -> web.Response:
         return web.json_response({"error": f"could not write {ENV_FILE.name}: {exc}"},
                                  status=500)
     log("config saved (applies to the next conversation)")
-    return web.json_response({"ok": True, "config": current})
+    return web.json_response({"ok": True, "config": mask_secrets(current)})
+
+
+async def api_reveal(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except ValueError:
+        return web.json_response({"error": "invalid json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "invalid json"}, status=400)
+    key = str(body.get("key") or "")
+    if key not in SECRET_KEYS:
+        return web.json_response({"error": "unknown secret"}, status=400)
+    value = load_config().get(key, "")
+    return web.json_response({"key": key, "value": value, "set": bool(value)})
 
 
 async def api_heartbeat(_request: web.Request) -> web.Response:
@@ -752,6 +780,64 @@ async def api_heartbeat(_request: web.Request) -> web.Response:
     _LAST_BEAT = _monotonic()
     _CLOSE_PENDING_AT = 0.0
     return web.Response(status=204)
+
+
+PROBE_WHY = {
+    401: "auth failed (check the API key)",
+    402: "usage limit reached (out of credits or quota)",
+    403: "forbidden (key lacks access)",
+    429: "rate limited (usage limit hit)",
+}
+
+
+def probe_provider(base_url: str, key: str, timeout: float = 5.0) -> dict:
+    url = base_url.rstrip("/") + "/models"
+    headers = {"Authorization": "Bearer " + key} if key else {}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return {"status": "up", "detail": f"HTTP {r.status}", "code": r.status}
+    except urllib.error.HTTPError as e:
+        why = PROBE_WHY.get(e.code, f"HTTP {e.code}")
+        return {"status": "down", "detail": why, "code": e.code}
+    except Exception as exc:
+        return {"status": "down", "detail": "unreachable (" + str(exc)[:80] + ")",
+                "code": 0}
+
+
+def check_stt_provider(cfg: dict) -> dict:
+    sel = resolve_stt(cfg)
+    if sel["engine"] == "remote" and sel["base_url"]:
+        state = probe_provider(sel["base_url"], sel["api_key"])
+        state["engine"] = "remote"
+        state["url"] = sel["base_url"]
+        return state
+    models = list_stt_models()
+    n = len(models.get("local_folders", []))
+    return {"status": "embedded", "engine": "whisper",
+            "detail": f"model {cfg.get('WHISPER_MODEL', 'small')}, {n} downloaded",
+            "url": ""}
+
+
+def check_tts_provider(cfg: dict) -> dict:
+    sel = resolve_tts(cfg)
+    if sel["engine"] == "remote" and sel["base_url"]:
+        state = probe_provider(sel["base_url"], sel["api_key"])
+        state["engine"] = "remote"
+        state["url"] = sel["base_url"]
+        return state
+    if sel["engine"] == "kokoro":
+        from local_kokoro import kokoro_ready
+
+        ready = kokoro_ready()
+        return {"status": "embedded", "engine": "kokoro",
+                "detail": ("model ready, voice " + (sel["kokoro_voice"] or "af_heart"))
+                          if ready else "model files missing - run setup voice step",
+                "ready": ready, "url": ""}
+    n = len(list(piper_dir().glob("*.onnx"))) if piper_dir().is_dir() else 0
+    return {"status": "embedded", "engine": "piper",
+            "detail": f"voice {sel['voice'] or '(none)'}, {n} downloaded",
+            "ready": n > 0, "url": ""}
 
 
 async def api_check(_request: web.Request) -> web.Response:
@@ -780,10 +866,15 @@ async def api_check(_request: web.Request) -> web.Response:
     except OSError:
         pass
     sel = resolve_llm(load_config())
+    cfg = load_config()
+    stt_state = await asyncio.to_thread(check_stt_provider, cfg)
+    tts_state = await asyncio.to_thread(check_tts_provider, cfg)
     return web.json_response({
         "livekit": {"status": "up" if lk_up else "down",
                     "url": setting("LIVEKIT_URL")},
         "llm": {"status": llm_state, "url": sel["base_url"], "kind": sel["kind"]},
+        "stt": stt_state,
+        "tts": tts_state,
         "publish": tunnel_info(),
         "gpu": gpu_state,
         "children": kids,
@@ -1302,32 +1393,6 @@ def _display_name(bid: str, exe: Path) -> str:
     return exe.stem.capitalize()
 
 
-def find_app_browser():
-    chosen = setting("UI_BROWSER", "").strip().strip('"')
-    installed = detect_browsers()
-    default = next((b for b in installed if b.get("default")), None)
-
-    def pick(b):
-        return Path(b["path"]), b["id"], bool(b["chromium"])
-
-    if chosen and chosen.lower() not in ("auto", "default"):
-        low = chosen.lower()
-        exact = next((b for b in installed if b["id"] == low), None)
-        if exact:
-            return pick(exact)
-        custom = Path(chosen)
-        if custom.is_file() and os.access(str(custom), os.X_OK):
-            bid, chromium = _browser_id_for_exe(custom)
-            return custom, bid, chromium
-        log(f"UI_BROWSER={chosen!r} not found - falling back to the default browser")
-    if (not chosen or chosen.lower() == "default") and default is not None:
-        return pick(default)
-
-    if installed:
-        return pick(installed[0])
-    return None
-
-
 def load_window_state() -> dict:
     try:
         with open(WINDOW_STATE_FILE, "r", encoding="utf-8") as f:
@@ -1507,6 +1572,44 @@ def track_window(proc, saved_mode: str, chromium: bool = True) -> None:
         _WIN_MINIMIZED = False
 
 
+def app_browser_candidates() -> list:
+    chosen = setting("UI_BROWSER", "").strip().strip('"')
+    installed = detect_browsers()
+    order = []
+
+    def add(path, bid, chromium):
+        try:
+            key = str(Path(path).resolve()).lower()
+        except OSError:
+            key = str(path).lower()
+        if not any(str(c[0]).lower() == key for c in order):
+            order.append((Path(path), bid, chromium))
+
+    if chosen and chosen.lower() not in ("auto", "default"):
+        low = chosen.lower()
+        exact = next((b for b in installed if b["id"] == low), None)
+        if exact:
+            add(exact["path"], exact["id"], bool(exact["chromium"]))
+        else:
+            custom = Path(chosen)
+            if custom.is_file() and os.access(str(custom), os.X_OK):
+                bid, chromium = _browser_id_for_exe(custom)
+                add(custom, bid, chromium)
+    default = next((b for b in installed if b.get("default")), None)
+    if default:
+        add(default["path"], default["id"], bool(default["chromium"]))
+    for b in installed:
+        add(b["path"], b["id"], bool(b["chromium"]))
+    return order
+
+
+def _spawn_browser(args: list) -> subprocess.Popen:
+    if os.name == "nt":
+        return subprocess.Popen(args, close_fds=True, creationflags=0x08000000)
+    return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def open_ui_when_ready() -> None:
     global _BROWSER, _BROWSER_JOBBED
     url = f"http://{HOST}:{PORT}/"
@@ -1519,54 +1622,49 @@ def open_ui_when_ready() -> None:
         log(f"UI ready at {url} (AUTO_OPEN=0 - not opening anything)")
         return
 
-
     if setting("UI_WINDOW", "1") == "1":
-        resolved = find_app_browser()
-        if resolved is not None:
-            exe, bid, chromium = resolved
-            own_profile = (setting("UI_PROFILE", "1") == "1") and chromium
-            try:
-                st = load_window_state()
-                mode = str(st.get("mode") or "windowed")
-                args = [str(exe)]
-                if chromium:
-                    args.append(f"--app={url}")
-                    args.append("--no-first-run")
-                    args.append("--no-default-browser-check")
-                    if own_profile:
-
-
-                        prof = ROOT / "user_data" / "browser-profile"
-                        prof.mkdir(parents=True, exist_ok=True)
-                        args.append(f"--user-data-dir={prof}")
-                else:
-                    args.append("--new-window")
-                    args.append(url)
-                    mode = "windowed"
-                if chromium and mode == "maximized":
-                    args.append("--start-maximized")
-                elif chromium and mode == "fullscreen":
-                    args.append("--start-fullscreen")
-                elif chromium:
-                    mode = "windowed"
-                    w, h = int(st.get("w") or 0), int(st.get("h") or 0)
-                    x, y = int(st.get("x") or 0), int(st.get("y") or 0)
-                    dpi = int(st.get("dpi") or 96) or 96
-                    if 400 <= w <= 12000 and 300 <= h <= 8000:
-
-                        scale = 96.0 / dpi
-                        args.append(f"--window-size={round(w * scale)},{round(h * scale)}")
-                        if -w + 100 <= x <= 20000 and -40 <= y <= 20000:
-                            args.append(f"--window-position={round(x * scale)},{round(y * scale)}")
+        candidates = app_browser_candidates()
+        if candidates:
+            tried = []
+            for exe, bid, chromium in candidates:
+                tried.append(exe.name)
+                own_profile = (setting("UI_PROFILE", "1") == "1") and chromium
+                try:
+                    st = load_window_state()
+                    mode = str(st.get("mode") or "windowed")
+                    args = [str(exe)]
+                    if chromium:
+                        args.append(f"--app={url}")
+                        args.append("--no-first-run")
+                        args.append("--no-default-browser-check")
+                        if own_profile:
+                            prof = ROOT / "user_data" / "browser-profile"
+                            prof.mkdir(parents=True, exist_ok=True)
+                            args.append(f"--user-data-dir={prof}")
                     else:
-                        args.append("--window-size=1240,860")
-                if os.name == "nt":
-                    proc = subprocess.Popen(args, close_fds=True,
-                                            creationflags=0x08000000)
-                else:
-                    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
-                                            stderr=subprocess.DEVNULL,
-                                            start_new_session=True)
+                        args.append("--new-window")
+                        args.append(url)
+                        mode = "windowed"
+                    if chromium and mode == "maximized":
+                        args.append("--start-maximized")
+                    elif chromium and mode == "fullscreen":
+                        args.append("--start-fullscreen")
+                    elif chromium:
+                        mode = "windowed"
+                        w, h = int(st.get("w") or 0), int(st.get("h") or 0)
+                        x, y = int(st.get("x") or 0), int(st.get("y") or 0)
+                        dpi = int(st.get("dpi") or 96) or 96
+                        if 400 <= w <= 12000 and 300 <= h <= 8000:
+                            scale = 96.0 / dpi
+                            args.append(f"--window-size={round(w * scale)},{round(h * scale)}")
+                            if -w + 100 <= x <= 20000 and -40 <= y <= 20000:
+                                args.append(f"--window-position={round(x * scale)},{round(y * scale)}")
+                        else:
+                            args.append("--window-size=1240,860")
+                    proc = _spawn_browser(args)
+                except Exception as exc:
+                    log(f"{exe.name} failed to launch ({exc}) - trying the next browser")
+                    continue
                 _BROWSER = proc
                 assign_job(proc)
                 _BROWSER_JOBBED = JOB is not None and os.name == "nt"
@@ -1591,19 +1689,17 @@ def open_ui_when_ready() -> None:
                     threading.Thread(target=_unix_watch_browser, args=(proc, chromium),
                                      daemon=True, name="win-track").start()
                 if own_profile:
-
-
                     try:
                         if proc.wait(timeout=6) is not None:
-                            log(f"{exe.name} exited immediately - opening the "
-                                "default browser instead")
+                            log(f"{exe.name} exited immediately - "
+                                f"retrying with the next browser")
                             _BROWSER = None
-                            raise RuntimeError("app browser exited at once")
+                            continue
                     except subprocess.TimeoutExpired:
                         pass
                 return
-            except Exception as exc:
-                log(f"could not launch the app window ({exc}) - using the browser")
+            log(f"none of the detected browsers worked ({', '.join(tried)}) "
+                "- opening the system default")
         else:
             log("no supported browser found for a standalone window - using the browser")
     try:
@@ -1634,6 +1730,7 @@ def build_app() -> web.Application:
     app.router.add_get("/token", token)
     app.router.add_get("/api/config", api_config_get)
     app.router.add_post("/api/config", api_config_post)
+    app.router.add_post("/api/reveal", api_reveal)
     app.router.add_get("/api/models/stt", api_models_stt)
     app.router.add_get("/api/models/tts", api_models_tts)
     app.router.add_get("/api/browsers", api_browsers)

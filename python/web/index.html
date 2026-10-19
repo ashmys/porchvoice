@@ -92,10 +92,12 @@
           </div>
           <div class="sect">Language model (OpenAI-compatible)</div>
           <div class="field">
-            <label>Provider profile <button type="button" class="minibtn" id="profsave" title="Store the current URL / key / model under this name">save</button> <button type="button" class="minibtn" id="profdelete" title="Delete this profile">delete</button></label>
-            <input type="text" id="profilename" list="profilelist" placeholder="Type or pick a profile (e.g. OpenRouter free, Local Llama...)">
-            <datalist id="profilelist"></datalist>
-            <div class="hint">Pick a profile to load its URL / key / model instantly. Changes to the base URL, API key or model name below save automatically - both to the app settings and to the active profile. "save" stores the current settings as a profile; "delete" removes the active one.</div>
+            <label>Provider profile <button type="button" class="minibtn" id="profsave" title="Store the current URL / model under this name">save</button> <button type="button" class="minibtn" id="profdelete" title="Delete the selected profile">delete</button></label>
+            <div class="profilebox">
+              <select id="profileselect"><option value="">pick a saved profile...</option></select>
+              <input type="text" id="profilename" placeholder="profile name (new or overwrite)">
+            </div>
+            <div class="hint">Pick a profile to load its URL / model instantly (the saved key state comes with it). "save" stores the current URL / model under the name on the right; "delete" removes the selected profile. Changes to the base URL, API key or model below save automatically to the app settings.</div>
           </div>
           <div class="field"><label>API base URL (empty = auto-detect local first)</label>
             <input type="text" id="cfg-LLM_BASE_URL" placeholder="http://127.0.0.1:11434/v1">
@@ -136,9 +138,22 @@
           <div class="field"><label>MCP status <button type="button" class="minibtn" id="mcptest">test connection</button></label>
             <div class="pubbox" id="mcpbox">not configured</div>
           </div>
+          <div class="sect">Provider status</div>
+          <div class="field"><label>Check everything <button type="button" class="minibtn" id="providercheck">check status</button></label>
+            <div class="pubbox" id="providerbox">tests LiveKit, LLM, STT, TTS and MCP - shows HTTP errors like 401 / 402 / 429 from OpenRouter and other cloud providers</div>
+          </div>
         </div>
 
         <div class="tabpage" id="tabspeech">
+          <div class="sect">Speech-to-text engine</div>
+          <div class="field"><label>STT engine</label>
+            <select id="cfg-STT_ENGINE">
+              <option value="">Auto (remote server if a URL is set, else embedded Whisper)</option>
+              <option value="whisper">Embedded Whisper (ignore the URL below)</option>
+              <option value="remote">Remote server (OpenAI-compatible)</option>
+            </select>
+            <div class="hint">Embedded Whisper runs offline on this machine. Remote mode works with any whisper-compatible server: whisper.cpp, faster-whisper-server, Groq, OpenAI, speech-to-text providers that expose POST {url}/audio/transcriptions.</div>
+          </div>
           <div class="sect">Remote STT server (optional)</div>
           <div class="field"><label>Whisper-compatible transcriptions URL</label>
             <input type="text" id="cfg-STT_BASE_URL" placeholder="http://127.0.0.1:9000/v1 (empty = embedded local Whisper)">
@@ -198,6 +213,16 @@
             </div>
           </div>
           <div class="hint">Still inaccurate with every model size? The browser's noise suppression and auto-gain can mangle speech before Whisper sees it. Try <b>Noise suppress = Off</b> (and Auto gain = Off) - applies to the next call. Keep Echo cancel On unless you use headphones.</div>
+          <div class="sect">Text-to-speech engine</div>
+          <div class="field"><label>TTS engine</label>
+            <select id="cfg-TTS_ENGINE">
+              <option value="kokoro">Kokoro (embedded, default)</option>
+              <option value="piper">Piper (embedded)</option>
+              <option value="remote">Remote server (OpenAI-compatible)</option>
+            </select>
+            <div class="hint">Kokoro and Piper run locally with no key. Remote mode works with any server exposing POST {url}/audio/speech (openedai-speech, piper wrappers, OpenAI, and other cloud TTS providers).</div>
+          </div>
+          <div class="field"><label>Kokoro voice</label><select id="cfg-KOKORO_VOICE"></select></div>
           <div class="sect">Remote TTS server (optional)</div>
           <div class="field"><label>OpenAI-compatible speech URL</label>
             <input type="text" id="cfg-TTS_BASE_URL" placeholder="http://127.0.0.1:8000/v1 (empty = embedded local Piper)">
@@ -207,7 +232,7 @@
             <div class="field"><label>TTS API key (optional)</label><input type="password" id="cfg-TTS_API_KEY" placeholder="empty = none"></div>
             <div class="field"><label>TTS model</label><input type="text" id="cfg-TTS_MODEL" placeholder="tts-1"></div>
           </div>
-          <div class="sect">Text-to-speech</div>
+          <div class="sect">Piper voice (used when engine = Piper)</div>
           <div class="field"><label>Piper voice</label><select id="cfg-TTS_VOICE"></select></div>
           <div class="field"><label>TTS speed <span class="rangeval" id="val-TTS_SPEED"></span></label>
             <input type="range" id="cfg-TTS_SPEED" min="0.7" max="1.6" step="0.05">

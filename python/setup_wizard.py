@@ -20,6 +20,11 @@ ENV_FILE = USER_DATA / ".env.local"
 YAML_FILE = USER_DATA / "livekit.yaml"
 WHISPER_BASE = USER_DATA / "models" / "whisper"
 PIPER_BASE = USER_DATA / "models" / "piper"
+KOKORO_BASE = USER_DATA / "models" / "kokoro"
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from keyvault import SECRET_KEYS, encrypt_value
 
 DRY_RUN = False
 AUTO = False
@@ -56,6 +61,16 @@ PIPER_VOICES = [
     ("en_GB-alba-medium", "en/en_GB/alba/medium"),
 ]
 PIPER_BASE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0"
+
+KOKORO_BASE_URL = (
+    "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+)
+KOKORO_FILES = ("kokoro-v1.0.onnx", "voices-v1.0.bin")
+KOKORO_VOICES = [
+    "af_heart", "af_bella", "af_nicole", "af_alloy", "af_sky", "af_sarah",
+    "am_adam", "am_michael", "am_fenrir", "am_puck",
+    "bf_emma", "bf_isabella", "bm_george", "bm_fable",
+]
 
 
 def hr(title: str) -> None:
@@ -99,6 +114,9 @@ def write_env(updates: dict) -> None:
                 k, _, v = line.partition("=")
                 cfg[k.strip()] = v.strip()
     cfg.update(updates)
+    for k in SECRET_KEYS:
+        if cfg.get(k) and not str(cfg[k]).startswith("enc:v1:"):
+            cfg[k] = encrypt_value(str(cfg[k]))
     lines = [
         "PorchVoice settings",
         "Edit in a text editor, or use the web UI gear icon.",
@@ -120,12 +138,16 @@ def write_env(updates: dict) -> None:
         f"LLM_COMPAT_MODE={cfg.get('LLM_COMPAT_MODE', '0')}",
         f"LLM_STREAMING={cfg.get('LLM_STREAMING', '1')}",
         "",
-        "# ---- STT: remote Whisper server (optional; empty = embedded local Whisper) ----",
+        "# ---- STT engine: empty = auto (remote if URL set), whisper = embedded, remote = server ----",
+        f"STT_ENGINE={cfg.get('STT_ENGINE', '')}",
+        "# ---- STT: remote Whisper-compatible server (optional) ----",
         f"STT_BASE_URL={cfg.get('STT_BASE_URL', '')}",
         f"STT_API_KEY={cfg.get('STT_API_KEY', '')}",
         f"STT_MODEL={cfg.get('STT_MODEL', 'whisper-1')}",
         "",
-        "# ---- TTS: remote speech server (optional; empty = embedded local Piper) ----",
+        "# ---- TTS engine: kokoro (default) | piper | remote ----",
+        f"TTS_ENGINE={cfg.get('TTS_ENGINE', 'kokoro')}",
+        "# ---- TTS: remote speech server (optional; used when TTS_ENGINE=remote) ----",
         f"TTS_BASE_URL={cfg.get('TTS_BASE_URL', '')}",
         f"TTS_API_KEY={cfg.get('TTS_API_KEY', '')}",
         f"TTS_MODEL={cfg.get('TTS_MODEL', 'tts-1')}",
@@ -141,7 +163,9 @@ def write_env(updates: dict) -> None:
         f"WHISPER_COMPUTE={cfg.get('WHISPER_COMPUTE', 'auto')}",
         f"WHISPER_LANGUAGE={cfg.get('WHISPER_LANGUAGE', 'en')}",
         "",
-        "# ---- Piper TTS (embedded engine) ----",
+        "# ---- Kokoro TTS (embedded engine, default) ----",
+        f"KOKORO_VOICE={cfg.get('KOKORO_VOICE', 'af_heart')}",
+        "# ---- Piper TTS (embedded engine, fallback) ----",
         f"TTS_VOICE={cfg.get('TTS_VOICE', 'en_US-amy-medium.onnx')}",
         f"TTS_SPEED={cfg.get('TTS_SPEED', '1.1')}",
         "",
@@ -281,7 +305,7 @@ def step_deps() -> None:
     pkgs = [
         "livekit-agents==1.8.8", "livekit-plugins-openai==1.8.8",
         "livekit-plugins-silero==1.8.8", "faster-whisper", "piper-tts",
-        "python-dotenv", "aiohttp", "mcp>=1.2",
+        "kokoro-onnx", "python-dotenv", "aiohttp", "mcp>=1.2",
     ]
     code = run([py, "-m", "pip", "install", *pkgs])
     if code != 0:
@@ -343,14 +367,17 @@ def step_config() -> None:
             mcp_token = ""
     updates["MCP_URL"] = mcp_url
     updates["MCP_AUTH_TOKEN"] = mcp_token
-    print("  Publish mode: local = this machine only; wifi = share on your LAN;")
-    print("  public = quick tunnel via cloudflared (step 6).")
+    print("  Publish mode: local = this machine only (default, no extra setup);")
+    print("  wifi = share on your LAN; public = quick tunnel via cloudflared (step 6).")
     mode = ask("Publish mode (local/wifi/public)", "local").strip().lower()
     if mode not in ("local", "wifi", "public"):
         mode = "local"
+    if mode == "local":
+        print("  local mode: nothing to publish - no tunnel, no LAN exposure, no step 6.")
     updates["PUBLISH_MODE"] = mode
     write_env(updates)
     print("  You can change every setting later in the web UI (gear icon).")
+    return mode
 
 
 def step_cloudflared() -> None:
@@ -495,6 +522,42 @@ def step_whisper_prefetch() -> None:
         print("  Load test timed out - try a smaller model.")
 
 
+def step_kokoro() -> bool:
+    hr("STEP 5a] Kokoro voice (default TTS engine)")
+    if DRY_RUN:
+        print("(dry-run) kokoro download skipped")
+        return True
+    model_dest = KOKORO_BASE / "kokoro-v1.0.onnx"
+    voices_dest = KOKORO_BASE / "voices-v1.0.bin"
+    if model_dest.is_file() and model_dest.stat().st_size > 100_000_000 \
+            and voices_dest.is_file():
+        print("  kokoro model already downloaded - skipping")
+        return True
+    for fname in KOKORO_FILES:
+        url = f"{KOKORO_BASE_URL}/{fname}"
+        min_bytes = 20_000_000 if fname.endswith(".bin") else 100_000_000
+        download_resumable(url, KOKORO_BASE / fname, fname, min_bytes=min_bytes)
+    print("  Test-synthesizing with kokoro-onnx...")
+    py = venv_python()
+    code = (
+        "from kokoro_onnx import Kokoro;\n"
+        f"k = Kokoro(r'{model_dest}', r'{voices_dest}');\n"
+        "samples, sr = k.create('Kokoro voice test.', voice='af_heart', speed=1.0, lang='en-us');\n"
+        "assert len(samples) > 1000;\n"
+        "print('KOKORO TEST OK')"
+    )
+    try:
+        r = subprocess.run([str(py), "-c", code], cwd=str(ROOT), timeout=600)
+        if r.returncode != 0:
+            print("  Kokoro test failed - check the error above. You can switch")
+            print("  TTS_ENGINE=piper in the settings instead.")
+            return False
+    except subprocess.TimeoutExpired:
+        print("  Kokoro test timed out.")
+        return False
+    return True
+
+
 def step_piper() -> None:
     hr("STEP 5] Piper TTS voice")
     print("  Pick a voice:")
@@ -529,6 +592,36 @@ def step_piper() -> None:
         print("  Piper test timed out.")
 
 
+def step_voice() -> None:
+    hr("STEP 5] Voice engine (TTS)")
+    print("  1) Kokoro (default - best quality, ~340 MB download)")
+    print("  2) Piper (lightweight, ~60 MB voice)")
+    print("  3) Skip (choose later in the web UI)")
+    choice = ask("Number", "1")
+    if choice == "2":
+        write_env({"TTS_ENGINE": "piper"})
+        step_piper()
+        return
+    if choice == "3":
+        print("  Skipped - the web UI can pick an engine later (TTS_ENGINE).")
+        return
+    write_env({"TTS_ENGINE": "kokoro"})
+    print("  Pick a Kokoro voice:")
+    for i, name in enumerate(KOKORO_VOICES, 1):
+        print(f"   {i}) {name}")
+    vchoice = ask("Number", "1")
+    try:
+        voice = KOKORO_VOICES[int(vchoice) - 1]
+    except (ValueError, IndexError):
+        voice = KOKORO_VOICES[0]
+    print(f"  Selected: {voice}")
+    write_env({"KOKORO_VOICE": voice})
+    if not step_kokoro():
+        print("  Falling back to Piper (TTS_ENGINE=piper).")
+        write_env({"TTS_ENGINE": "piper"})
+        step_piper()
+
+
 def done() -> None:
     hr("ALL DONE")
     if os.name == "nt":
@@ -536,6 +629,17 @@ def done() -> None:
     else:
         print("  Start everything with  ./start.sh")
     print("  Then open  http://127.0.0.1:8090  and press play.")
+
+
+def run_all() -> None:
+    step_deps(); step_livekit()
+    mode = step_config()
+    step_whisper_prefetch(); step_voice()
+    if mode == "public":
+        step_cloudflared()
+    else:
+        print("\n  Publish mode is not public - skipping cloudflared setup (step 6).")
+    done()
 
 
 def main() -> None:
@@ -551,7 +655,7 @@ def main() -> None:
 
     if models_only:
         step_whisper_prefetch()
-        step_piper()
+        step_voice()
         done()
         return
 
@@ -561,13 +665,12 @@ def main() -> None:
         print("  2) LiveKit server")
         print("  3) Configuration (LLM API, MCP, publish mode)")
         print("  4) Whisper STT model")
-        print("  5) Piper TTS voice")
-        print("  6) cloudflared (public publish mode)")
+        print("  5) Voice engine (Kokoro / Piper TTS)")
+        print("  6) cloudflared (only for public publish mode)")
         print("  0) Run ALL steps, then exit")
         choice = ask("Choose", "0")
         if DRY_RUN and AUTO:
-            step_deps(); step_livekit(); step_config()
-            step_whisper_prefetch(); step_piper(); step_cloudflared(); done()
+            run_all()
             return
         if choice == "1":
             step_deps()
@@ -578,12 +681,11 @@ def main() -> None:
         elif choice == "4":
             step_whisper_prefetch()
         elif choice == "5":
-            step_piper()
+            step_voice()
         elif choice == "6":
             step_cloudflared()
         elif choice == "0":
-            step_deps(); step_livekit(); step_config()
-            step_whisper_prefetch(); step_piper(); step_cloudflared(); done()
+            run_all()
             return
 
 

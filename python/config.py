@@ -6,6 +6,8 @@ import socket
 import urllib.request
 from pathlib import Path
 
+from keyvault import decrypt_value
+
 ROOT = Path(__file__).resolve().parent.parent
 ENV_FILE = ROOT / "user_data" / ".env.local"
 
@@ -27,6 +29,7 @@ CONFIG_DEFAULTS = {
     "STT_BASE_URL": "",
     "STT_API_KEY": "",
     "STT_MODEL": "whisper-1",
+    "STT_ENGINE": "",
     "WHISPER_MODEL": "small",
     "WHISPER_DEVICE": "auto",
     "WHISPER_COMPUTE": "auto",
@@ -40,8 +43,10 @@ CONFIG_DEFAULTS = {
     "TTS_BASE_URL": "",
     "TTS_API_KEY": "",
     "TTS_MODEL": "tts-1",
+    "TTS_ENGINE": "kokoro",
     "TTS_VOICE": "en_US-amy-medium.onnx",
     "TTS_SPEED": "1.1",
+    "KOKORO_VOICE": "af_heart",
     "MCP_URL": "",
     "MCP_AUTH_TOKEN": "",
     "MCP_TIMEOUT": "5",
@@ -77,6 +82,9 @@ HEAVY_KEYS = (
     "TTS_BASE_URL",
     "LLM_BASE_URL",
     "LLM_MODEL",
+    "STT_ENGINE",
+    "TTS_ENGINE",
+    "KOKORO_VOICE",
 )
 
 LOCAL_LLM_CANDIDATES = (
@@ -116,6 +124,9 @@ def load_config() -> dict:
     for old, new in TEXTGEN_ALIASES.items():
         if cfg.get(old) and not cfg.get(new):
             cfg[new] = cfg[old]
+    for k in list(cfg):
+        if isinstance(cfg[k], str) and cfg[k].startswith("enc:v1:"):
+            cfg[k] = decrypt_value(cfg[k])
     return cfg
 
 
@@ -220,45 +231,76 @@ def resolve_llm(cfg: dict, probe=None) -> dict:
 def resolve_stt(cfg: dict) -> dict:
     base = (cfg.get("STT_BASE_URL", "") or "").strip()
     key = (cfg.get("STT_API_KEY", "") or "").strip()
+    engine = (cfg.get("STT_ENGINE", "") or "").strip().lower()
+    model = (cfg.get("STT_MODEL", "") or "whisper-1").strip()
+    if engine == "whisper":
+        base = ""
     if base:
         return {
             "base_url": base.rstrip("/"), "api_key": key,
-            "model": (cfg.get("STT_MODEL", "") or "whisper-1").strip(),
+            "model": model, "engine": "remote",
             "kind": classify_endpoint(base), "source": "config",
         }
     if key and os.environ.get("PORCHVOICE_STT_CLOUD", "") == "1":
         return {
             "base_url": "https://api.openai.com/v1", "api_key": key,
-            "model": (cfg.get("STT_MODEL", "") or "whisper-1").strip(),
+            "model": model, "engine": "remote",
             "kind": "cloud", "source": "fallback:openai",
         }
-    return {"base_url": "", "api_key": "", "model": "", "kind": "local", "source": "embedded"}
+    return {"base_url": "", "api_key": "", "model": "", "engine": "whisper",
+            "kind": "local", "source": "embedded"}
 
 
 def resolve_tts(cfg: dict) -> dict:
     base = (cfg.get("TTS_BASE_URL", "") or "").strip()
     key = (cfg.get("TTS_API_KEY", "") or "").strip()
     voice = (cfg.get("TTS_VOICE", "") or "").strip()
+    engine = (cfg.get("TTS_ENGINE", "kokoro") or "kokoro").strip().lower()
+    if engine not in ("kokoro", "piper", "remote"):
+        engine = "kokoro"
     if base:
         return {
             "base_url": base.rstrip("/"), "api_key": key,
             "model": (cfg.get("TTS_MODEL", "") or "tts-1").strip(),
-            "voice": voice or "piper",
+            "voice": voice or "alloy", "engine": "remote",
             "speed": _num(cfg, "TTS_SPEED", "1.1"),
+            "kokoro_voice": (cfg.get("KOKORO_VOICE", "") or "af_heart").strip(),
             "kind": classify_endpoint(base), "source": "config",
         }
-    from local_tts import find_voice
+    kokoro_voice = (cfg.get("KOKORO_VOICE", "") or "af_heart").strip()
+    if engine == "kokoro":
+        from local_kokoro import kokoro_ready
 
-    if not find_voice(voice or "en_US-amy-medium.onnx") and key:
-        return {
-            "base_url": "https://api.openai.com/v1", "api_key": key,
-            "model": (cfg.get("TTS_MODEL", "") or "tts-1").strip(),
-            "voice": "alloy", "speed": _num(cfg, "TTS_SPEED", "1.1"),
-            "kind": "cloud", "source": "fallback:openai",
-        }
+        if not kokoro_ready():
+            from local_tts import find_voice
+
+            if find_voice(voice or "en_US-amy-medium.onnx"):
+                engine = "piper"
+            elif key:
+                return {
+                    "base_url": "https://api.openai.com/v1", "api_key": key,
+                    "model": (cfg.get("TTS_MODEL", "") or "tts-1").strip(),
+                    "voice": "alloy", "engine": "remote",
+                    "speed": _num(cfg, "TTS_SPEED", "1.1"),
+                    "kokoro_voice": kokoro_voice,
+                    "kind": "cloud", "source": "fallback:openai",
+                }
+    if engine == "piper":
+        from local_tts import find_voice
+
+        if not find_voice(voice or "en_US-amy-medium.onnx") and key:
+            return {
+                "base_url": "https://api.openai.com/v1", "api_key": key,
+                "model": (cfg.get("TTS_MODEL", "") or "tts-1").strip(),
+                "voice": "alloy", "engine": "remote",
+                "speed": _num(cfg, "TTS_SPEED", "1.1"),
+                "kokoro_voice": kokoro_voice,
+                "kind": "cloud", "source": "fallback:openai",
+            }
     return {
         "base_url": "", "api_key": "", "model": "", "voice": voice,
-        "speed": _num(cfg, "TTS_SPEED", "1.1"), "kind": "local",
+        "engine": engine, "speed": _num(cfg, "TTS_SPEED", "1.1"),
+        "kokoro_voice": kokoro_voice, "kind": "local",
         "source": "embedded",
     }
 

@@ -139,7 +139,8 @@ class ChatList {
       }
       return div;
     }
-    div.className = "msg " + (it.who === "user" ? "you" : "bot");
+    div.className = "msg " + (it.who === "user" ? "you"
+                    : it.who === "error" ? "err" : "bot");
     if (it.who === "bot" && it.think) {
       const det = document.createElement("details");
       det.className = "think";
@@ -221,7 +222,9 @@ function addBubble(who, text, id, final, think, thinkFinal) {
   const it = trackLive(key, who, text, final, think, thinkFinal);
   chatList.upsert({ key, who, text: it.text, final: it.final,
                     think: it.think, thinkFinal: it.thinkFinal });
-  if (final && it.text) pulseState(who === "bot" ? "speaking" : "thinking");
+  if (final && it.text && who !== "error") {
+    pulseState(who === "bot" ? "speaking" : "thinking");
+  }
   return chatList.nodeByKey.get(key) || null;
 }
 

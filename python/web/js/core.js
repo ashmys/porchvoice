@@ -56,8 +56,8 @@ function closeModal(id) {
   try { $(id).dispatchEvent(new CustomEvent("modalclose")); } catch (e) {}
 }
 
-async function fetchJson(url) {
-  const r = await fetch(url);
+async function fetchJson(url, opts) {
+  const r = await fetch(url, opts);
   if (!r.ok) throw new Error(url + " -> HTTP " + r.status);
   return r.json();
 }

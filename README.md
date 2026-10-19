@@ -5,14 +5,15 @@ A local-first realtime voice assistant that lives on your own hardware. Talk to 
 ```
 browser mic -> LiveKit -> Silero VAD -> Whisper STT (local, remote, or cloud)
     -> LLM (auto-detected local OpenAI-compatible server, or cloud with a key)
-    -> Piper TTS (local) / OpenAI-compatible speech server (remote or cloud)
+    -> Kokoro TTS (local, default) / Piper TTS (local) / OpenAI-compatible speech server (remote or cloud)
     -> LiveKit -> browser speakers, with live transcripts and tool-call log
 ```
 
 - **Agent**: canonical `WorkerOptions(entrypoint_fnc=entrypoint)` + `AgentSession` + `Agent` with `@function_tool` built-ins, matching the livekit-agents 1.8.8 basic_agent example
-- **STT**: embedded faster-whisper by default; or any whisper.cpp / faster-whisper / OpenAI-compatible `/audio/transcriptions` server via `STT_BASE_URL`
-- **LLM**: any OpenAI-compatible chat API — auto-detects Ollama, LM Studio, llama.cpp, text-generation-webui on localhost, falls back to a cloud endpoint when a key is set; a compatibility mode exists for minimal servers that reject tool calls
-- **TTS**: embedded Piper by default; or any OpenAI-compatible `/audio/speech` server via `TTS_BASE_URL`
+- **STT**: embedded faster-whisper by default; or any whisper.cpp / faster-whisper / OpenAI-compatible `/audio/transcriptions` server via `STT_BASE_URL` + `STT_ENGINE=remote`
+- **LLM**: any OpenAI-compatible chat API — auto-detects Ollama, LM Studio, llama.cpp, text-generation-webui on localhost, falls back to a cloud endpoint when a key is set; a compatibility mode exists for minimal servers that reject tool calls; provider errors (bad key, usage limits, unreachable) are surfaced as red messages in the chat panel
+- **TTS**: embedded Kokoro by default (Piper as the lightweight fallback); or any OpenAI-compatible `/audio/speech` server via `TTS_BASE_URL` + `TTS_ENGINE=remote`
+- **API keys**: encrypted at rest in `user_data/.env.local` (`enc:v1:...`), masked in the UI and API responses, with a show/hide toggle in Settings
 - **MCP**: one `MCP_URL` (streamable HTTP or SSE, auto-selected), optional bearer token, tools attached straight into the agent session
 - **Publish modes**: `local` (this machine), `wifi` (your LAN), `public` (cloudflared quick tunnel + `/lk` WebSocket proxy)
 - **UI**: single-page voice client — live audio visualization, conversation panel with text chat, tool-call log, full settings, browsable chat history
@@ -43,10 +44,10 @@ browser mic -> LiveKit -> Silero VAD -> Whisper STT (local, remote, or cloud)
 2. Double-click **`setup.bat`**. The wizard offers:
    - `1` Python venv + packages
    - `2` LiveKit server download
-   - `3` Configuration — LLM URL/key (blank = auto-detect local first), MCP URL + bearer token, publish mode
+   - `3` Configuration — LLM URL/key (blank = auto-detect local first), MCP URL + bearer token, publish mode (local mode needs no publish setup)
    - `4` Whisper STT model pre-download + GPU test
-   - `5` Piper TTS voice
-   - `6` cloudflared (only needed for `public` publish mode)
+   - `5` Voice engine — Kokoro (default, ~340 MB) or Piper voice
+   - `6` cloudflared (only needed for `public` publish mode; skipped automatically for local)
 3. Double-click **`start.bat`** and open `http://127.0.0.1:8090`.
 
 ### Linux / macOS
@@ -90,13 +91,16 @@ Every provider follows the same rule: **a `http://` base URL counts as local, `h
 
 **STT**
 
-- `STT_BASE_URL` empty → embedded faster-whisper (the model picked in setup).
+- `STT_BASE_URL` empty (and `STT_ENGINE` not `remote`) → embedded faster-whisper (the model picked in setup).
 - Set it to any server exposing `POST {url}/audio/transcriptions` (whisper.cpp server `http://...:9000/v1`, faster-whisper-server, Groq, OpenAI). Key optional.
+- `STT_ENGINE=whisper` forces the embedded engine even when a URL is set; `STT_ENGINE=remote` forces the remote path.
 
 **TTS**
 
-- `TTS_BASE_URL` empty → embedded Piper (the voice picked in setup).
-- Set it to any server exposing `POST {url}/audio/speech` (openedai-speech, piper wrappers, OpenAI). Key optional.
+- `TTS_ENGINE` = `kokoro` (default) / `piper` / `remote`.
+- Kokoro: embedded Kokoro-82M ONNX engine, models in `user_data/models/kokoro/`, voice picked by `KOKORO_VOICE` (`af_heart` by default). If the model is missing, PorchVoice falls back to Piper, then to a cloud endpoint when a key is set.
+- Piper: embedded Piper, voice picked by `TTS_VOICE` (the old default).
+- `TTS_BASE_URL` set (or `TTS_ENGINE=remote`) → any server exposing `POST {url}/audio/speech` (openedai-speech, piper wrappers, OpenAI). Key optional.
 
 **MCP**
 
@@ -135,13 +139,16 @@ Chat history lands in `user_data/chat/<timestamp>-<room>.jsonl` (one file per ro
 |---|---|---|
 | `PUBLISH_MODE` | `local` | `local` / `wifi` / `public` |
 | `LLM_BASE_URL` | *(empty)* | OpenAI-compatible base URL; empty = auto-detect local first |
-| `LLM_API_KEY` | *(empty)* | Optional; enables the cloud fallback too |
+| `LLM_API_KEY` | *(empty)* | Optional; stored encrypted (`enc:v1:...`) in this file |
 | `LLM_MODEL` | *(empty)* | Model id; empty = server default |
 | `LLM_COMPAT_MODE` | `0` | `1` = minimal payloads, no tool calling |
+| `STT_ENGINE` | *(empty)* | *(empty)* = auto, `whisper` = embedded, `remote` = server |
 | `STT_BASE_URL` / `STT_API_KEY` / `STT_MODEL` | *(empty)* | Remote STT server; empty = embedded Whisper |
-| `TTS_BASE_URL` / `TTS_API_KEY` / `TTS_MODEL` | *(empty)* | Remote TTS server; empty = embedded Piper |
+| `TTS_ENGINE` | `kokoro` | `kokoro` / `piper` / `remote` |
+| `KOKORO_VOICE` | `af_heart` | Embedded Kokoro voice |
+| `TTS_BASE_URL` / `TTS_API_KEY` / `TTS_MODEL` | *(empty)* | Remote TTS server |
 | `MCP_URL` | *(empty)* | Single MCP server URL (`/mcp` suffix = streamable HTTP) |
-| `MCP_AUTH_TOKEN` | *(empty)* | Optional bearer token for MCP |
+| `MCP_AUTH_TOKEN` | *(empty)* | Optional bearer token for MCP; stored encrypted |
 | `MCP_TIMEOUT` | `5` | MCP request timeout in seconds |
 | `WHISPER_*` | `small`… | Embedded Whisper engine settings |
 | `TTS_VOICE` / `TTS_SPEED` | `en_US-amy-medium.onnx` / `1.1` | Embedded Piper engine settings |
@@ -150,8 +157,10 @@ Chat history lands in `user_data/chat/<timestamp>-<room>.jsonl` (one file per ro
 
 ## 8. Troubleshooting
 
-- **No reply from the bot** — the console prints the resolved LLM endpoint at startup (`LLM: ...`). Check that the local server is running or the key is right; the agent retries every conversation start.
+- **No reply from the bot** — the console prints the resolved LLM endpoint at startup (`LLM: ...`), and LLM failures now appear as red error bubbles in the conversation panel (bad key = 401, usage limit = 402/429, unreachable = connection). Press *check status* in Settings → Provider status to test every endpoint.
+- **API key hidden** — keys are stored encrypted and the settings form shows `••••`; press *show* next to a key field to reveal it.
 - **MCP tools not firing** — press *test connection* in settings; it lists the tools the server exposes. Remember `LLM_COMPAT_MODE=1` disables tool calling entirely.
 - **Public mode connects but no audio remotely** — forward UDP 50000–50100 on your router, or run a TURN server; the quick tunnel carries signaling and the web UI only.
 - **Whisper slow** — pick a smaller model in settings, or check the GPU line in the startup banner.
+- **Kokoro voice missing** — run setup step 5 again, or switch `TTS_ENGINE=piper` in Settings → Speech (Piper runs automatically when the Kokoro model files are absent).
 - **Port 8090 taken** — set `PUBLIC_PORT` in `user_data/.env.local`.

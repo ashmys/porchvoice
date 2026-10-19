@@ -30,12 +30,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger("porchvoice-agent")
 
+ERROR_HINTS = (
+    (("401", "unauthorized", "invalid api key", "invalid_api_key",
+      "no auth credentials", "incorrect api key"),
+     "LLM rejected the API key (401). Check the key in Settings."),
+    (("402", "insufficient", "credits", "quota exceeded", "billing"),
+     "LLM usage limit reached (402): out of credits or quota on this "
+     "provider. Top up or switch provider."),
+    (("429", "rate limit", "too many requests", "rate_limit"),
+     "LLM rate limit hit (429): usage is limited right now. Wait a bit, "
+     "switch model, or change provider."),
+    (("403", "forbidden"),
+     "LLM refused the request (403): key lacks access to this model."),
+    (("timeout", "timed out", "connection", "unreachable", "getaddrinfo",
+      "failed to establish", "temporarily unavailable", "502", "503",
+      "504", "refused"),
+     "Cannot reach the LLM API. Check the URL, your network, and the "
+     "provider status in Settings."),
+)
+
+
+def friendly_llm_error(detail: str) -> str:
+    d = (detail or "").lower()
+    for needles, hint in ERROR_HINTS:
+        if any(n in d for n in needles):
+            return hint
+    return "LLM error: " + ((detail or "unknown")[:220])
+
+
 CONFIG_FALLBACK = {
     "WHISPER_MODEL": "small",
     "WHISPER_DEVICE": "auto",
     "WHISPER_COMPUTE": "auto",
     "TTS_VOICE": "en_US-amy-medium.onnx",
     "TTS_SPEED": "1.1",
+    "TTS_ENGINE": "kokoro",
+    "KOKORO_VOICE": "af_heart",
     "STT_BASE_URL": "",
     "TTS_BASE_URL": "",
     "LLM_BASE_URL": "",
@@ -206,7 +236,6 @@ class TranscriptHub:
             self._written += 1
         except OSError as exc:
             logger.warning("chat history write failed (%s)", exc)
-
     def _send(self, who: str, text: str, msg_id: str, final: bool,
               think: str = "") -> None:
         if final:
@@ -258,6 +287,17 @@ class TranscriptHub:
         text = (text or "").strip()
         if text or think:
             self._send("bot", text, msg_id, final, think)
+
+    def error(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        self._seq += 1
+        msg_id = f"e{self._seq}"
+        self._write_history("error", text, msg_id)
+        self._publish({"who": "error", "text": text, "id": msg_id,
+                       "final": True}, "transcript")
+        logger.error("surfaced to chat: %s", text)
 
     def tool_call(self, name: str, args: str, output: str, is_error: bool = False) -> None:
         payload = {"name": name, "arguments": args[:500],
@@ -461,6 +501,12 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                          is_error: bool = False) -> None:
             hub.tool_call(name, args, output, is_error)
 
+        def on_llm_error(detail: str) -> None:
+            hub.error(friendly_llm_error(detail))
+
+        def on_llm_think(text: str, msg_id: str, final: bool) -> None:
+            hub.think(text, msg_id, final)
+
         mcp_sel = resolve_mcp(cfg)
         mcp_toolset = None
         if mcp_sel["enabled"]:
@@ -478,7 +524,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 stt=GuardedSTT(stt, guard) if guard is not None else stt,
                 vad=vad,
             ),
-            llm=build_llm(cfg),
+            llm=build_llm(cfg, on_error=on_llm_error, on_think=on_llm_think),
             tts=tts,
             turn_handling={
                 "turn_detection": None,
@@ -529,6 +575,42 @@ async def entrypoint(ctx: agents.JobContext) -> None:
 
         session.on("user_input_transcribed")(on_user_transcript)
 
+        def on_session_error(ev) -> None:
+            err = getattr(ev, "error", None)
+            if err is None:
+                return
+            code = getattr(err, "status_code", None) or ""
+            body = getattr(err, "body", None)
+            detail = str(getattr(err, "message", "") or body or err)
+            if code:
+                detail = f"HTTP {code}: {detail}"
+            hub.error(friendly_llm_error(detail))
+
+        session.on("error")(on_session_error)
+
+        def item_text(item) -> str:
+            txt = (getattr(item, "text_content", None) or "").strip()
+            if txt:
+                return txt
+            parts = [c for c in (getattr(item, "content", None) or [])
+                     if isinstance(c, str)]
+            return " ".join(parts).strip()
+
+        def on_conversation_item(ev) -> None:
+            item = getattr(ev, "item", None)
+            if item is None:
+                return
+            role = str(getattr(item, "role", ""))
+            item_id = str(getattr(item, "id", "") or "")
+            if role == "assistant":
+                txt = item_text(item)
+                if txt:
+                    hub.bot(txt, msg_id=item_id, final=True)
+                if guard is not None:
+                    guard.note_spoken(txt)
+
+        session.on("conversation_item_added")(on_conversation_item)
+
         def clear_model_context() -> None:
             try:
                 session.history.truncate(max_items=0)
@@ -548,7 +630,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             if not text:
                 return
             hub.user(text)
-            asyncio.ensure_future(reply_to_text(session, text))
+            asyncio.ensure_future(reply_to_text(session, hub, text))
 
         ctx.room.on("data_received")(on_data)
 
@@ -557,25 +639,11 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                         len(early_inputs))
             for text in list(early_inputs):
                 hub.user(text)
-                asyncio.ensure_future(reply_to_text(session, text))
+                asyncio.ensure_future(reply_to_text(session, hub, text))
             early_inputs.clear()
 
         if guard is not None:
             session.on("agent_state_changed")(guard.on_agent_state)
-
-            def _on_item(ev, _guard=guard) -> None:
-                item = getattr(ev, "item", None)
-                role = str(getattr(item, "role", ""))
-                if role != "assistant":
-                    return
-                txt = getattr(item, "text_content", None)
-                if not txt:
-                    parts = [c for c in (getattr(item, "content", None) or [])
-                             if isinstance(c, str)]
-                    txt = " ".join(parts)
-                _guard.note_spoken(txt)
-
-            session.on("conversation_item_added")(_on_item)
 
         def on_tools_executed(ev) -> None:
             try:
@@ -604,6 +672,11 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                          ctx.room.name)
         logger.error("The conversation stopped, but the agent worker is "
                      "still alive.")
+        if hub is not None:
+            try:
+                hub.error(friendly_llm_error(str(exc)))
+            except Exception:
+                logger.exception("error publish failed")
         msg = str(exc).lower()
         if "Connection" in type(exc).__name__ or "connect" in msg:
             logger.error("FIX -> check the LLM provider and the LiveKit server, "
@@ -616,11 +689,15 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             hub.close()
 
 
-async def reply_to_text(session, text: str) -> None:
+async def reply_to_text(session, hub, text: str) -> None:
     try:
         await session.generate_reply(user_input=text)
-    except Exception:
+    except Exception as exc:
         logger.exception("text chat reply failed")
+        try:
+            hub.error(friendly_llm_error(str(exc)))
+        except Exception:
+            pass
 
 
 def preflight() -> None:

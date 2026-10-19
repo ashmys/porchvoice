@@ -289,3 +289,21 @@ body.panel-open #status { left: calc(min(340px, 42vw) + 26px); }
 .msg.toolnote.toolerr { background: rgba(248,113,113,.07); border-color: rgba(248,113,113,.25); }
 .msg.toolnote.toolerr .toolhead { color: #f87171; }
 .msg.toolnote .toolbody { color: var(--dim); white-space: pre-wrap; margin-top: 2px; }
+
+.msg.err { align-self: stretch; background: rgba(248,113,113,.09);
+  border: 1px solid rgba(248,113,113,.35); color: #fca5a5; }
+.msg.err .txt { color: #fca5a5; }
+
+.keywrap { display: flex; gap: 6px; align-items: stretch; }
+.keywrap input { flex: 1 1 auto; min-width: 0; }
+.eyebtn {
+  flex: 0 0 auto; font-size: 10.5px; letter-spacing: .04em; cursor: pointer;
+  background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.14);
+  color: var(--dim); border-radius: 8px; padding: 6px 10px;
+}
+.eyebtn:hover { color: var(--fg); background: rgba(255,255,255,.1); }
+
+.profilebox { display: flex; gap: 6px; }
+.profilebox select, .profilebox input { min-width: 0; }
+.profilebox select { flex: 1 1 45%; }
+.profilebox input { flex: 1 1 55%; }

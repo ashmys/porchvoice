@@ -5,7 +5,8 @@ import logging
 logger = logging.getLogger("porchvoice-providers")
 
 
-def build_llm(cfg: dict, probe=None):
+def build_llm(cfg: dict, probe=None, on_error=None, on_reply=None,
+              on_think=None):
     from config import resolve_llm
 
     sel = resolve_llm(cfg, probe=probe)
@@ -29,6 +30,7 @@ def build_llm(cfg: dict, probe=None):
         return create_textgen_llm(
             base_url=sel["base_url"], api_key=key, model=model,
             streaming=streaming, thinking=thinking, speak_thinking=speak_thinking,
+            on_error=on_error, on_reply=on_reply, on_think=on_think,
         )
     from livekit.plugins.openai import LLM as OpenAILLM
 
@@ -42,7 +44,7 @@ def build_stt(cfg: dict):
     from config import resolve_stt
 
     sel = resolve_stt(cfg)
-    if sel["base_url"]:
+    if sel["engine"] == "remote" and sel["base_url"]:
         from remote_stt import create_remote_stt
 
         return create_remote_stt(
@@ -69,12 +71,19 @@ def build_tts(cfg: dict):
     from config import resolve_tts
 
     sel = resolve_tts(cfg)
-    if sel["base_url"]:
+    if sel["engine"] == "remote" and sel["base_url"]:
         from remote_tts import create_remote_tts
 
         return create_remote_tts(
             base_url=sel["base_url"], api_key=sel["api_key"],
             model=sel["model"], voice=sel["voice"], speed=sel["speed"],
+        )
+    if sel["engine"] == "kokoro":
+        from local_kokoro import create_kokoro_tts
+
+        return create_kokoro_tts(
+            voice_name=sel["kokoro_voice"] or "af_heart",
+            speed=sel["speed"],
         )
     from local_tts import create_piper_tts
 

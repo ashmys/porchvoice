@@ -29,8 +29,48 @@ document.addEventListener("input", (ev) => {
 
 
 const PROF_KEY = "providerProfiles";
-const PROF_FIELDS = ["LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"];
+const PROF_FIELDS = ["LLM_BASE_URL", "LLM_MODEL"];
+const PROF_KEY_FIELD = "LLM_API_KEY";
 let activeProfile = "";
+
+const SECRET_IDS = ["cfg-LLM_API_KEY", "cfg-STT_API_KEY", "cfg-TTS_API_KEY",
+                    "cfg-MCP_AUTH_TOKEN", "cfg-LIVEKIT_API_SECRET"];
+
+function decorateSecretInputs() {
+  for (const id of SECRET_IDS) {
+    const el = $(id);
+    if (!el || el.parentElement.classList.contains("keywrap")) continue;
+    const wrap = document.createElement("div");
+    wrap.className = "keywrap";
+    el.parentNode.insertBefore(wrap, el);
+    wrap.appendChild(el);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "eyebtn";
+    btn.textContent = "show";
+    btn.addEventListener("click", async () => {
+      if (btn.textContent === "show") {
+        try {
+          const d = await fetchJson("/api/reveal", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key: id.slice(4) }),
+          });
+          el.type = "text";
+          el.value = d.value || "";
+          btn.textContent = "hide";
+          if (!d.set) toast("No value saved for this field yet");
+        } catch (e) {
+          toast("Reveal failed: " + (e && e.message ? e.message : e));
+        }
+      } else {
+        el.type = "password";
+        el.value = el.value ? SECRET_SENTINEL : "";
+        btn.textContent = "show";
+      }
+    });
+    wrap.appendChild(btn);
+  }
+}
 
 function loadProfiles() {
   try { return JSON.parse(localStorage.getItem(PROF_KEY) || "{}") || {}; }
@@ -40,15 +80,19 @@ function storeProfiles(p) {
   try { localStorage.setItem(PROF_KEY, JSON.stringify(p)); } catch (e) {}
 }
 function renderProfileList() {
-  const dl = $("profilelist");
-  if (!dl) return;
+  const sel = $("profileselect");
+  if (!sel) return;
   const profiles = loadProfiles();
-  dl.innerHTML = "";
+  const keep = activeProfile;
+  sel.innerHTML = '<option value="">pick a saved profile...</option>';
   Object.keys(profiles).sort().forEach((name) => {
     const o = document.createElement("option");
     o.value = name;
-    dl.appendChild(o);
+    o.textContent = name;
+    sel.appendChild(o);
   });
+  if (keep && profiles[keep]) sel.value = keep;
+  else sel.value = "";
 }
 function loadProfile(name) {
   const profiles = loadProfiles();
@@ -58,8 +102,12 @@ function loadProfile(name) {
     const el = $("cfg-" + k);
     if (el && typeof p[k] === "string") el.value = p[k];
   });
+  const keyEl = $("cfg-" + PROF_KEY_FIELD);
+  if (keyEl) keyEl.value = p[PROF_KEY_FIELD] === "" ? "" : SECRET_SENTINEL;
   activeProfile = name;
   try { localStorage.setItem("lastProfile", name); } catch (e) {}
+  const nameEl = $("profilename");
+  if (nameEl) nameEl.value = name;
   scheduleAutoSave();
   refreshLlmModels();
   toast("Profile '" + name + "' loaded");
@@ -74,6 +122,8 @@ function saveProfile(name, silent) {
     const el = $("cfg-" + k);
     profiles[name][k] = el ? el.value : "";
   });
+  const keyEl = $("cfg-" + PROF_KEY_FIELD);
+  profiles[name][PROF_KEY_FIELD] = (keyEl && keyEl.value) ? SECRET_SENTINEL : "";
   storeProfiles(profiles);
   activeProfile = name;
   try { localStorage.setItem("lastProfile", name); } catch (e) {}
@@ -81,24 +131,28 @@ function saveProfile(name, silent) {
   if (!silent) toast("Profile '" + name + "' saved");
 }
 function deleteProfile(name) {
-  name = (name || activeProfile || "").trim();
-  if (!name) { toast("No active profile to delete"); return; }
+  name = (name || $("profileselect").value || activeProfile || "").trim();
+  if (!name) { toast("Pick a profile to delete"); return; }
   const profiles = loadProfiles();
   if (!profiles[name]) { toast("No profile named '" + name + "'"); return; }
   delete profiles[name];
   storeProfiles(profiles);
-  renderProfileList();
   if (activeProfile === name) activeProfile = "";
+  renderProfileList();
   toast("Profile '" + name + "' deleted");
 }
 
-$("profilename").addEventListener("input", () => {
-  const name = $("profilename").value.trim();
-  if (name && loadProfiles()[name]) loadProfile(name);
+$("profileselect").addEventListener("change", () => {
+  const name = $("profileselect").value;
+  if (name) loadProfile(name);
 });
 $("profsave").addEventListener("click", () => saveProfile($("profilename").value));
-$("profdelete").addEventListener("click", () => deleteProfile($("profilename").value));
+$("profdelete").addEventListener("click", () => deleteProfile(""));
 
+
+const SECRET_SENTINEL = "__saved__";
+
+decorateSecretInputs();
 
 let autoSaveTimer = 0;
 let autoSaving = false;
@@ -109,13 +163,13 @@ function scheduleAutoSave() {
 }
 
 function markActiveProfileFromValues() {
-
-
   const vals = PROF_FIELDS.map((k) => { const el = $("cfg-" + k); return el ? el.value : ""; });
+  const keyVal = ($("cfg-" + PROF_KEY_FIELD) || {}).value || "";
   const profiles = loadProfiles();
   let match = "";
   for (const [name, p] of Object.entries(profiles)) {
-    if (PROF_FIELDS.every((k, i) => (p[k] || "") === vals[i])) { match = name; break; }
+    const keyOk = (p[PROF_KEY_FIELD] || "") === (keyVal ? SECRET_SENTINEL : "");
+    if (keyOk && PROF_FIELDS.every((k, i) => (p[k] || "") === vals[i])) { match = name; break; }
   }
   activeProfile = match;
   return match;
@@ -232,6 +286,15 @@ async function fillBrowserPicker(cfg) {
   }
 }
 
+const KOKORO_VOICES = [
+  "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica", "af_kore",
+  "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+  "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael",
+  "am_onyx", "am_puck", "am_santa",
+  "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+  "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
+];
+
 async function loadConfigForm() {
   const [cfgR, sttR, ttsR] = await Promise.all([
     fetchJson("/api/config"),
@@ -257,6 +320,15 @@ async function loadConfigForm() {
     ensureOpt(sel, cfg.WHISPER_MODEL);
     sel.value = cfg.WHISPER_MODEL;
   }
+  const ksel = $("cfg-KOKORO_VOICE");
+  if (ksel) {
+    ksel.innerHTML = "";
+    const kvoices = ttsR.kokoro_voices && ttsR.kokoro_voices.length ? ttsR.kokoro_voices : KOKORO_VOICES;
+    kvoices.forEach((v) => addOpt(ksel, v, v));
+    const kcur = cfg.KOKORO_VOICE || "af_heart";
+    ensureOpt(ksel, kcur);
+    ksel.value = kcur;
+  }
   const vsel = $("cfg-TTS_VOICE");
   vsel.innerHTML = "";
   (ttsR.voices || []).forEach((v) => addOpt(vsel, v.name, v.name + (v.local ? " \u2713" : " (download needed)")));
@@ -266,12 +338,8 @@ async function loadConfigForm() {
   }
   renderProfileList();
   const last = (() => { try { return localStorage.getItem("lastProfile") || ""; } catch (e) { return ""; } })();
-  const profName = $("profilename");
-  if (last && loadProfiles()[last]) {
-    profName.value = last;
-    loadProfile(last);
-  }
-  markActiveProfileFromValues();
+  if (last && loadProfiles()[last]) loadProfile(last);
+  else markActiveProfileFromValues();
   refreshLlmModels();
 }
 
@@ -285,7 +353,9 @@ async function refreshLlmModels() {
   const sel = $("llmmodels"), hint = $("modelhint");
   if (!sel) return;
   const url = ($("cfg-LLM_BASE_URL").value || "").trim();
-  const key = ($("cfg-LLM_API_KEY").value || "").trim();
+  const keyEl = $("cfg-LLM_API_KEY");
+  const rawKey = (keyEl ? keyEl.value : "").trim();
+  const key = rawKey === SECRET_SENTINEL ? null : rawKey;
   modelFetchStartedAt = Date.now();
   sel.innerHTML = '<option value="">loading...</option>';
   hint.textContent = "Fetching model list from " + (url || "(auto-detect)") + " ...";
@@ -378,6 +448,44 @@ async function refreshMcpStatus() {
   }
 }
 $("mcptest").addEventListener("click", refreshMcpStatus);
+
+async function refreshProviderStatus() {
+  const box = $("providerbox");
+  if (!box) return;
+  box.textContent = "checking providers...";
+  const parts = [];
+  try {
+    const c = await fetchJson("/api/check");
+    const lk = c.livekit || {};
+    parts.push("livekit " + (lk.status === "up" ? "up" : "DOWN"));
+    const llm = String(c.llm && c.llm.status || "");
+    parts.push("llm " + (llm.startsWith("up") ? llm : llm || "down"));
+    const stt = c.stt || {};
+    parts.push("stt " + (stt.status === "up" ? "up (" + stt.detail + ")"
+                          : stt.status === "down" ? "DOWN - " + stt.detail
+                          : stt.status + " (" + stt.detail + ")"));
+    const tts = c.tts || {};
+    parts.push("tts " + (tts.status === "up" ? "up (" + tts.detail + ")"
+                          : tts.status === "down" ? "DOWN - " + tts.detail
+                          : tts.status + " (" + tts.detail + ")"));
+    box.textContent = parts.join(" \u00b7 ");
+  } catch (e) {
+    box.textContent = "status check failed - " + (e && e.message ? e.message : e);
+    return;
+  }
+  try {
+    const url = ($("cfg-MCP_URL").value || "").trim();
+    if (!url) { parts.push("mcp not configured"); box.textContent = parts.join(" \u00b7 "); return; }
+    const m = await fetchJson("/api/mcp/status");
+    parts.push(m.ok ? "mcp connected (" + (m.tools || []).length + " tools)"
+                    : "mcp unreachable - " + (m.error || "?"));
+    box.textContent = parts.join(" \u00b7 ");
+  } catch (e) {
+    parts.push("mcp probe failed");
+    box.textContent = parts.join(" \u00b7 ");
+  }
+}
+$("providercheck").addEventListener("click", refreshProviderStatus);
 
 async function refreshPublishBox() {
   const box = $("pubbox");
