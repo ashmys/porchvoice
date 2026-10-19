@@ -163,17 +163,28 @@ API keys are stored encrypted (`enc:v1:...`) and masked in the UI. Empty values 
 
 ```
 start.sh / start.bat
-  └─ python/server.py            one-window supervisor + web UI/API (aiohttp)
-       ├─ bin/livekit-server     child, auto-restart, yaml synced to your key/secret
+  └─ python/server.py            facade -> python/sup/ (supervisor + web UI/API)
+       ├─ sup/webapi.py          /token, /api/config, /api/models/*, /api/modules/*,
+       │                         /api/chat/*, /lk WS+HTTP proxy for tunnels
+       ├─ sup/procs.py           child spawn + watch loop (fatal errors stop restarts)
+       ├─ bin/livekit-server     child, yaml synced to your key/secret
        ├─ python/agent.py        child, livekit-agents 1.8.8 worker
        │    ├─ AgentSession(stt=, llm=, tts=, vad=, tools=[MCP...])
        │    ├─ Assistant(Agent) with @function_tool built-ins (time, calculate)
-       │    └─ TranscriptHub: transcript + tool-call topics, .jsonl chat log
+       │    └─ TranscriptHub: streams partial bot text as it is generated,
+       │       then one final transcript + .jsonl chat log
        ├─ bin/llama-server       child on :8900 when STT_ENGINE=gguf (Qwen3-ASR)
        ├─ bin/llama-server       child on :8899 when LLM_ENGINE=gguf (chat model)
        ├─ cloudflared            child, only in public mode
-       └─ python/web/*           single-page UI, /lk WS+HTTP proxy for tunnels
+       └─ python/web/*           single-page UI, no build step
 ```
+
+Every python module stays under a thousand lines: supervisor logic lives in
+`python/sup/` (paths, state, envstore, procs, webapi, ggufsrv, modelist,
+modmgr, downloads, chatstore, tunnel, uiopen, winjob), the setup menu in
+`python/setupwiz/`, and engine adapters follow the `local_*.py` /
+`remote_*.py` naming. `server.py` / `setup_wizard.py` are thin facades kept
+for `start.bat` / `setup.bat` compatibility.
 
 **Where things live:** settings in `user_data/.env.local` · chat history in `user_data/chat/*.jsonl` · models in `user_data/models/{whisper,kokoro,piper,gguf-asr,llm}` · binaries in `bin/`. All of it is user data — safe to keep across updates.
 
@@ -181,9 +192,13 @@ start.sh / start.bat
 
 ## 9. Troubleshooting
 
+- **start.bat window closes instantly with no message** — fixed: a refactor regression dropped the supervisor's entry point, so `python server.py` exited silently with code 0. The entry block is back; any real startup failure now prints a traceback and the window stays open (`if errorlevel 1 pause`).
 - **Setup warns `python-dotenv could not parse statement`** — old versions wrote header lines without `#`. PorchVoice repairs the file automatically at startup.
 - **`api_secret is required` / token 500 / agent restart loop** — an empty `LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET` line used to wipe the defaults. Empty values no longer override defaults, credentials are passed explicitly to the worker, and `livekit.yaml` is re-synced. A fatal config error stops the restart loop (so does a run of fast crashes); fix the setting and press *Settings → Restart*.
 - **Mic seems dead** — run the Mic test (section 6). Permission denied → address-bar icon → Allow; held by another app → close it; phone over wifi http → use `public` mode.
+- **Transcript shows Qwen template junk** (`<|im_start|>`, `assistant`, `user:` labels) — fixed: every STT answer passes through `clean_transcript` (python/remote_stt.py) which strips chat-template tokens and role labels before the text reaches the conversation. If you run a custom ASR server and still see artifacts, include one example in a bug report.
+- **Assistant text used to wait for the voice to finish** — fixed: the reply text now streams into the panel word by word while it is being generated (the same way your input shows instantly), then settles into the final bubble; TTS audio is unaffected.
+- **Past chats disappeared** — fixed: *Clear* now empties only the current session file; older conversations in `user_data/chat/` are kept. Setup and config saves never touch the chat folder.
 - **No reply from the assistant** — LLM errors appear as red bubbles in the conversation panel (401 bad key, 402/429 quota/rate, unreachable). *Settings → check status* tests LiveKit, LLM, STT, TTS, and MCP in one click and shows the resolved endpoints.
 - **GGUF engine does not answer** — check the `stt-gguf` / `llm-gguf` lines in the console: missing model files or `llama-server` binary say exactly which setup menu to run, or point `*_GGUF_SERVER` at a server you run yourself.
 - **Downloaded model not detected** — it must sit in `LLM_GGUF_MODELS_DIR` (default `user_data/models/llm/`) and not start with `mmproj` (those are ASR projection files). The Detected models dropdown refreshes from disk.

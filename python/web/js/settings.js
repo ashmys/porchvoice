@@ -341,6 +341,7 @@ async function loadConfigForm() {
   const last = (() => { try { return localStorage.getItem("lastProfile") || ""; } catch (e) { return ""; } })();
   if (last && loadProfiles()[last]) loadProfile(last);
   else markActiveProfileFromValues();
+  updateLlmEngineState();
   refreshLlmModels();
   refreshLlmGguf();
 }
@@ -354,6 +355,7 @@ let lastAutoPick = "";
 async function refreshLlmModels() {
   const sel = $("llmmodels"), hint = $("modelhint");
   if (!sel) return;
+  if (llmEngineManaged()) { updateLlmEngineState(); return; }
   const url = ($("cfg-LLM_BASE_URL").value || "").trim();
   const keyEl = $("cfg-LLM_API_KEY");
   const rawKey = (keyEl ? keyEl.value : "").trim();
@@ -413,6 +415,37 @@ async function refreshLlmModels() {
 }
 
 $("refreshmodels").addEventListener("click", refreshLlmModels);
+
+// ---------- LLM engine field locking (managed llama.cpp) ----------
+
+const LLM_MANAGED_IDS = ["cfg-LLM_BASE_URL", "cfg-LLM_API_KEY", "cfg-LLM_MODEL",
+                         "llmmodels", "refreshmodels",
+                         "profileselect", "profilename", "profsave", "profdelete"];
+
+function llmEngineManaged() {
+  const el = $("cfg-LLM_ENGINE");
+  return !!el && el.value === "gguf";
+}
+
+function updateLlmEngineState() {
+  const managed = llmEngineManaged();
+  for (const id of LLM_MANAGED_IDS) {
+    const el = $(id);
+    if (!el) continue;
+    el.disabled = managed;
+    const field = el.closest(".field");
+    if (field) field.classList.toggle("disabled", managed);
+  }
+  const hint = $("modelhint");
+  if (hint && managed) {
+    hint.textContent = "The built-in llama.cpp server manages the model - "
+      + "URL / API key / model picker are not used. Pick the model in the "
+      + "GGUF section below (or switch the engine back to Auto / API).";
+  }
+}
+
+$("cfg-LLM_ENGINE").addEventListener("change", updateLlmEngineState);
+
 $("llmmodels").addEventListener("change", () => {
   const v = $("llmmodels").value;
   if (v) {
@@ -644,6 +677,11 @@ $("llmggufdownload").addEventListener("click", async () => {
     });
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
+    if (d.already) {
+      toast(d.message || ("Already downloaded: " + (d.file || id)));
+      refreshLlmGguf();
+      return;
+    }
     toast("Downloading " + id + " in the background...");
     refreshLlmGguf();
   } catch (e) {

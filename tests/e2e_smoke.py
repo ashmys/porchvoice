@@ -588,6 +588,122 @@ def section_setup_preserve() -> None:
         tmp.parent.rmdir()
 
 
+async def section_transcript_stream() -> None:
+    print("[1g] transcript cleanup + chat history + streaming display")
+    import tempfile
+
+    from remote_stt import clean_transcript
+
+    cases = [
+        ("<|im_start|>user<|im_end|><|im_start|>assistant\n hello there "
+         "<|im_end|>", "hello there"),
+        ("<|im_start|>user\n what time is it<|im_end|>"
+         "<|im_start|>assistant\n", "what time is it"),
+        ("hello there", "hello there"),
+        ("<|audio_start|>hello world<|audio_end|>", "hello world"),
+        ("user: what is the weather", "what is the weather"),
+        ('"quoted speech"', "quoted speech"),
+        ("assistant manager needed", "assistant manager needed"),
+        ("<|im_start|>assistant\n The assistant manager spoke <|im_end|>",
+         "The assistant manager spoke"),
+    ]
+    for raw, want in cases:
+        got = clean_transcript(raw)
+        check("qwen format stripped: " + raw[:34].replace("\n", "\\n"),
+              got == want, f"got {got!r} want {want!r}")
+
+    from sup import chatstore, paths as sup_paths
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        real_chat_dir = sup_paths.CHAT_DIR
+        sup_paths.CHAT_DIR = tmp
+        old_f = tmp / "20260101-000000-testroom.jsonl"
+        old_f.write_text(json.dumps({"who": "user", "text": "older chat",
+                                     "ts": "t", "id": "o1"}) + "\n",
+                         encoding="utf-8")
+        os.utime(old_f, (1_000_000_000, 1_000_000_000))
+        cur_f = tmp / "20260202-000000-testroom.jsonl"
+        cur_f.write_text(json.dumps({"who": "user", "text": "current q",
+                                     "ts": "t", "id": "c1"}) + "\n"
+                         + json.dumps({"who": "bot", "text": "current a",
+                                       "ts": "t", "id": "c2"}) + "\n",
+                         encoding="utf-8")
+        cleared = chatstore.clear_history("testroom")
+        check("clear empties only the current session",
+              cleared == [cur_f.name] and cur_f.read_text() == ""
+              and "older chat" in old_f.read_text(), str(cleared))
+        foreign = tmp / "evil-notes.jsonl"
+        foreign.write_text("keep me", encoding="utf-8")
+        os.utime(foreign, (1_000_000_000, 1_000_000_000))
+        chatstore.clear_history("testroom", wipe_all=True)
+        check("wipe_all clears sessions but skips foreign names",
+              foreign.read_text() == "keep me", foreign.read_text())
+        old_f.write_text(json.dumps({"who": "user", "text": "older chat",
+                                     "ts": "t", "id": "o1"}) + "\n",
+                         encoding="utf-8")
+        cur_f.write_text("{}", encoding="utf-8")
+        os.utime(old_f, (1_000_000_000, 1_000_000_000))
+        sessions = chatstore.list_sessions()
+        check("list_sessions reads turns",
+              any(s["file"] == old_f.name and s["turns"] == 1
+                  and s["first"] == "older chat" for s in sessions), str(sessions))
+    finally:
+        sup_paths.CHAT_DIR = real_chat_dir
+        import shutil as _sh2
+        _sh2.rmtree(tmp, ignore_errors=True)
+
+    import agent as agent_mod
+
+    class _FakePub:
+        def __init__(self):
+            self.sent = []
+
+        async def publish_data(self, data, reliable=False, topic=""):
+            self.sent.append((topic, json.loads(data)))
+
+    class _FakeRoom:
+        def __init__(self):
+            self.local_participant = _FakePub()
+
+    async def _hub_checks():
+        room = _FakeRoom()
+        hub = agent_mod.TranscriptHub(room)
+        hub.PARTIAL_MIN_GAP = 0
+        await asyncio.sleep(0)
+        hub.bot("hel", "m1", final=False)
+        hub.bot("hello wor", "m1", final=False)
+        await asyncio.sleep(0.01)
+        partials = [p for t, p in room.local_participant.sent
+                    if t == "transcript" and not p.get("final")]
+        check("bot text streams as partials",
+              len(partials) >= 2 and partials[-1]["text"] == "hello wor",
+              str(partials))
+        check("partial adopts the streaming bubble id",
+              hub.adopt_pending("x") == "m1", hub.adopt_pending("x"))
+        hub.bot("hello world", "m1", final=True, think="")
+        await asyncio.sleep(0.01)
+        finals = [p for t, p in room.local_participant.sent
+                  if t == "transcript" and p.get("final")]
+        check("final publishes once under same id",
+              len(finals) == 1 and finals[0]["text"] == "hello world"
+              and finals[0]["id"] == "m1", str(finals))
+        hub.bot("hello world", "m2", final=True)
+        await asyncio.sleep(0.01)
+        finals = [p for t, p in room.local_participant.sent
+                  if t == "transcript" and p.get("final")]
+        check("duplicate final is suppressed (one bubble)",
+              len(finals) == 1, str(finals))
+        hub.user("hi there")
+        await asyncio.sleep(0.01)
+        users = [p for t, p in room.local_participant.sent
+                 if t == "transcript" and p.get("who") == "user"]
+        check("user text still publishes instantly",
+              len(users) == 1 and users[0]["final"] is True, str(users))
+
+    await _hub_checks()
+
+
 async def section_modules_api() -> None:
     print("[3c] modules + models/llm API (list, select, remove, in-use guard)")
     import tempfile
@@ -671,6 +787,35 @@ async def section_modules_api() -> None:
         _sh.rmtree(tmp, ignore_errors=True)
 
 
+def section_supervisor_entry() -> None:
+    print("[5] server.py entry point (start.bat silent-death regression)")
+    import shutil
+    import tempfile
+
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        shutil.copytree(ROOT / "python", tmp / "python",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        p = subprocess.run(
+            [sys.executable, "-u", str(tmp / "python" / "server.py")],
+            capture_output=True, text=True, timeout=180, cwd=str(tmp))
+        out = p.stdout + p.stderr
+        # temp ROOT has no .venv, so a correct boot reaches main() and dies
+        # loudly there; the lost __main__ guard exited 0 with no output
+        check("python server.py runs main() instead of exiting silently",
+              p.returncode != 0 and ".venv missing" in out,
+              f"rc={p.returncode} out={out[:200]!r}")
+        check("facade import as module still does not boot the supervisor",
+              subprocess.run(
+                  [sys.executable, "-c",
+                   "import sys; sys.path.insert(0, r'" + str(tmp / "python")
+                   + "'); import server; print('IMPORT_ONLY')"],
+                  capture_output=True, text=True, timeout=180,
+                  cwd=str(tmp)).stdout.count("IMPORT_ONLY") == 1)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main_async() -> None:
     global LK_PORT
     LK_PORT = free_port()
@@ -680,12 +825,14 @@ async def main_async() -> None:
     section_env_file()
     section_llm_gguf()
     section_setup_preserve()
+    await section_transcript_stream()
     section_providers()
     await section_server()
     await section_config_api()
     await section_modules_api()
     await section_mcp_live()
     section_worker_boot()
+    section_supervisor_entry()
 
 
 def main() -> None:

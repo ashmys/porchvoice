@@ -323,3 +323,8 @@ body.panel-open #status { left: calc(min(340px, 42vw) + 26px); }
   padding: 2px 8px; flex: 0 0 auto; }
 .modrow .modstate.on { background: rgba(74,222,128,.12); color: #4ade80; }
 .modrow .modstate.off { background: rgba(255,255,255,.06); color: var(--dim); }
+
+/* managed llama.cpp: URL / key / model picker fields are not used */
+.field.disabled { opacity: .45; }
+.field.disabled input, .field.disabled select, .field.disabled button {
+  pointer-events: none; }

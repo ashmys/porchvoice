@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import logging
+import re
 import wave
 
 import numpy as np
@@ -12,6 +13,42 @@ from livekit.agents import APIConnectOptions, stt as lk_stt
 logger = logging.getLogger("remote-stt")
 
 SAMPLE_RATE = 16000
+
+# Audio LM servers built on llama.cpp (Qwen3-ASR & friends) sometimes answer
+# with the model's chat template wrapped around the real transcript, e.g.
+# "<|im_start|>user ... <|im_end|>assistant\n hello there <|im_end|>". Strip
+# all of that so the user's speech is all that reaches the conversation.
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|<>]{1,64}\|>")
+_AUDIO_PLACEHOLDER_RE = re.compile(
+    r"<__(?:audio|sound)__>|\[AUDIO\]|<\|audio_start\|>|<\|audio_end\|>")
+_ROLE_LABEL_RE = re.compile(
+    r"^\s*(?:assistant|system)?[\s:|-]*(?:user|human)\b[\s:|-]*", re.IGNORECASE)
+_LEADING_BOT_RE = re.compile(r"^\s*(?:assistant|system)\b[\s:|-]*", re.IGNORECASE)
+_TRAILING_ROLE_RE = re.compile(
+    r"[\s:|-]*(?:assistant|system)\b[\s:|-]*$", re.IGNORECASE)
+_QUOTE_PAIRS = ("\"", "'", "\u201c\u201d", "\u2018\u2019")
+
+
+def clean_transcript(raw: str) -> str:
+    """Remove chat-template artifacts from an ASR server response."""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    templated = bool(_SPECIAL_TOKEN_RE.search(text))
+    text = _SPECIAL_TOKEN_RE.sub(" ", text)
+    text = _AUDIO_PLACEHOLDER_RE.sub(" ", text)
+    text = _ROLE_LABEL_RE.sub("", text, count=1)
+    if templated:
+        # after template stripping the speech may sit behind a bare
+        # "assistant" turn label - only trust this when the raw answer
+        # really contained template markers
+        text = _LEADING_BOT_RE.sub("", text, count=1)
+    text = _TRAILING_ROLE_RE.sub("", text, count=1)
+    for quotes in _QUOTE_PAIRS:
+        if len(text) >= 2 and text[0] in quotes and text[-1] in quotes:
+            text = text[1:-1]
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
 
 
 def buffer_to_wav_bytes(buffer) -> bytes:
@@ -60,7 +97,6 @@ class RemoteSTT(lk_stt.STT):
             await self._session.close()
 
     async def _recognize_impl(self, buffer, *, language=None, conn_options=None):
-        t0 = asyncio.get_event_loop().time()
         text = await self._transcribe(buffer)
         lang = language or self._language or "en"
         duration = getattr(buffer, "duration", 0.0)
@@ -86,6 +122,8 @@ class RemoteSTT(lk_stt.STT):
             content_type="audio/wav",
         )
         form.add_field("model", self._model)
+        # greedy decoding: audio LMs hallucinate template junk far less at 0
+        form.add_field("temperature", "0")
         if self._language:
             form.add_field("language", self._language)
         url = self._base_url + "/audio/transcriptions"
@@ -98,7 +136,12 @@ class RemoteSTT(lk_stt.STT):
                                  resp.status, url, body[:200])
                     return ""
                 data = json.loads(body)
-                return (data.get("text") or "").strip()
+                raw = (data.get("text") or "").strip()
+                text = clean_transcript(raw)
+                if text != raw:
+                    logger.info("STT server returned chat-template artifacts - "
+                                "cleaned %r -> %r", raw[:160], text[:160])
+                return text
         except Exception as exc:
             logger.error("Remote STT request failed (%s)", exc)
             return ""

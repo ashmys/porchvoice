@@ -2,7 +2,67 @@ from __future__ import annotations
 
 import logging
 
+from livekit.agents import llm
+
 logger = logging.getLogger("porchvoice-providers")
+
+
+class _TapStream:
+    """Forward an LLMStream to the caller while reporting each text delta,
+    so the UI can show the assistant's words as they are generated."""
+
+    def __init__(self, inner, on_reply) -> None:
+        self._inner = inner
+        self._on_reply = on_reply
+        self._acc = []
+        self._msg_id = ""
+
+    async def __aenter__(self):
+        await self._inner.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self._inner.__aexit__(exc_type, exc, tb)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            chunk = await self._inner.__anext__()
+        except StopAsyncIteration:
+            self._acc.clear()
+            raise
+        delta = getattr(chunk, "delta", None)
+        piece = getattr(delta, "content", None) if delta is not None else None
+        if piece:
+            self._msg_id = self._msg_id or str(getattr(chunk, "id", "") or "b-tap")
+            self._acc.append(piece)
+            try:
+                self._on_reply("".join(self._acc), self._msg_id, False, "")
+            except Exception:
+                logger.exception("on_reply tap failed")
+        return chunk
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+class _TapLLM(llm.LLM):
+    """Wrap a livekit LLM plugin and tap its streamed text deltas."""
+
+    def __init__(self, inner, on_reply) -> None:
+        super().__init__()
+        self._inner = inner
+        self._on_reply = on_reply
+
+    def chat(self, *, chat_ctx, tools=None, conn_options=None, **kwargs):
+        stream = self._inner.chat(chat_ctx=chat_ctx, tools=tools,
+                                  conn_options=conn_options, **kwargs)
+        return _TapStream(stream, self._on_reply)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 def build_llm(cfg: dict, probe=None, on_error=None, on_reply=None,
@@ -42,7 +102,10 @@ def build_llm(cfg: dict, probe=None, on_error=None, on_reply=None,
     logger.info("LLM: %s (%s, key %s, model=%s)",
                 sel["base_url"], sel["kind"],
                 "set" if sel["api_key"] else "none", model)
-    return OpenAILLM(base_url=sel["base_url"], api_key=key, model=model)
+    inner = OpenAILLM(base_url=sel["base_url"], api_key=key, model=model)
+    if on_reply is not None:
+        return _TapLLM(inner, on_reply)
+    return inner
 
 
 def build_stt(cfg: dict):

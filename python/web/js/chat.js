@@ -412,7 +412,7 @@ $("clearyes").addEventListener("click", async () => {
       throw new Error(why);
     }
     const d = await r.json();
-    toast(d.cleared && d.cleared.length ? "Cleared: panel + saved history + model context"
+    toast(d.cleared && d.cleared.length ? "Cleared: panel + current session + model context (older conversations kept)"
                                         : "Panel cleared (no saved history for this session)");
   } catch (e) {
     toast("Panel cleared, but history cleanup failed: " + (e && e.message ? e.message : e));

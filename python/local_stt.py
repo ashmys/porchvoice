@@ -145,7 +145,6 @@ def create_stt(
         logger.info("Whisper '%s' not in models folder - using HF cache", model)
         src = model
     logger.info("STT device plan: %s on %s (%s) [gpu_detected=%s]", model, device, compute, gpu)
-    t0 = time.time()
     logger.info("Loading Whisper '%s' on %s (%s)...", model, device, compute)
     try:
         wm = WhisperModel(src, device=device, compute_type=compute)

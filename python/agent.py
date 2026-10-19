@@ -195,6 +195,8 @@ class GuardedSTT(lk_stt.STT):
 
 
 class TranscriptHub:
+    PARTIAL_MIN_GAP = 0.12
+
     def __init__(self, room, history_path=None) -> None:
         self._room = room
         self._seq = 0
@@ -202,6 +204,10 @@ class TranscriptHub:
         self._history = None
         self._history_path = None
         self._written = 0
+        self._pending_id = ""
+        self._pending_text = ""
+        self._last_partial_pub = 0.0
+        self._last_final = ("", "", 0.0)
         if history_path is not None:
             try:
                 CHAT_DIR.mkdir(parents=True, exist_ok=True)
@@ -239,12 +245,34 @@ class TranscriptHub:
             logger.warning("chat history write failed (%s)", exc)
     def _send(self, who: str, text: str, msg_id: str, final: bool,
               think: str = "") -> None:
+        if who == "bot" and not final:
+            now = time.monotonic()
+            if now - self._last_partial_pub < self.PARTIAL_MIN_GAP:
+                return
+            self._last_partial_pub = now
+            if self._pending_id and self._pending_id != msg_id:
+                self._finalize(self._pending_id, self._pending_text, "")
+            self._pending_id = msg_id
+            self._pending_text = text
         if final:
             self._write_history(who, text, msg_id, think)
         payload = {"who": who, "text": text, "id": msg_id, "final": final}
         if think:
             payload["think"] = think
         self._publish(payload, "transcript")
+
+    def _finalize(self, msg_id: str, text: str, think: str) -> None:
+        now = time.monotonic()
+        prev_text, _prev_id, prev_at = self._last_final
+        fresh = text and text == prev_text and (now - prev_at) < 3.0
+        if not fresh:
+            self._write_history("bot", text, msg_id, think)
+            self._publish({"who": "bot", "text": text, "id": msg_id,
+                           "final": True}, "transcript")
+            self._last_final = (text, msg_id, now)
+        if self._pending_id == msg_id:
+            self._pending_id = ""
+            self._pending_text = ""
 
     def _publish(self, payload: dict, topic: str) -> None:
         try:
@@ -262,12 +290,12 @@ class TranscriptHub:
             return
         task = loop.create_task(coro)
         self._tasks.add(task)
-        task.add_done_callback(self._on_pub_done)
+        task.add_done_callback(lambda t, topic=topic: self._on_pub_done(topic, t))
 
-    def _on_pub_done(self, task) -> None:
+    def _on_pub_done(self, topic: str, task) -> None:
         self._tasks.discard(task)
         if not task.cancelled() and task.exception():
-            logger.warning("%s publish failed (%s)", task.exception())
+            logger.warning("%s publish failed (%s)", topic, task.exception())
 
     def think(self, text: str, msg_id: str, final: bool) -> None:
         payload = {"who": "bot", "text": "", "id": msg_id,
@@ -287,7 +315,17 @@ class TranscriptHub:
             think: str = "") -> None:
         text = (text or "").strip()
         if text or think:
-            self._send("bot", text, msg_id, final, think)
+            if final:
+                self._finalize(msg_id, text, think)
+                if self._last_final[1] != msg_id:
+                    return
+            else:
+                self._send("bot", text, msg_id, False, think)
+
+    def adopt_pending(self, item_id: str) -> str:
+        """Let a completed assistant item finalize under the same bubble id
+        the live stream already created, so the UI has exactly one bubble."""
+        return self._pending_id or item_id
 
     def error(self, text: str) -> None:
         text = (text or "").strip()
@@ -508,6 +546,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         def on_llm_think(text: str, msg_id: str, final: bool) -> None:
             hub.think(text, msg_id, final)
 
+        def on_llm_reply(text: str, msg_id: str, final: bool,
+                         think: str = "") -> None:
+            hub.bot(text, msg_id=msg_id, final=final, think=think)
+
         mcp_sel = resolve_mcp(cfg)
         mcp_toolset = None
         if mcp_sel["enabled"]:
@@ -525,7 +567,8 @@ async def entrypoint(ctx: agents.JobContext) -> None:
                 stt=GuardedSTT(stt, guard) if guard is not None else stt,
                 vad=vad,
             ),
-            llm=build_llm(cfg, on_error=on_llm_error, on_think=on_llm_think),
+            llm=build_llm(cfg, on_error=on_llm_error, on_think=on_llm_think,
+                          on_reply=on_llm_reply),
             tts=tts,
             turn_handling={
                 "turn_detection": None,
@@ -606,7 +649,7 @@ async def entrypoint(ctx: agents.JobContext) -> None:
             if role == "assistant":
                 txt = item_text(item)
                 if txt:
-                    hub.bot(txt, msg_id=item_id, final=True)
+                    hub.bot(txt, msg_id=hub.adopt_pending(item_id), final=True)
                 if guard is not None:
                     guard.note_spoken(txt)
 
