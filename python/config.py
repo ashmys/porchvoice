@@ -26,6 +26,13 @@ CONFIG_DEFAULTS = {
     "LLM_STREAMING": "1",
     "LLM_THINKING": "0",
     "LLM_SPEAK_THINKING": "0",
+    "LLM_ENGINE": "",
+    "LLM_GGUF_SERVER": "",
+    "LLM_GGUF_PORT": "8899",
+    "LLM_GGUF_MODEL": "",
+    "LLM_GGUF_MODELS_DIR": "",
+    "LLM_GGUF_NGL": "99",
+    "LLM_GGUF_CTX": "4096",
     "STT_BASE_URL": "",
     "STT_API_KEY": "",
     "STT_MODEL": "whisper-1",
@@ -205,33 +212,88 @@ def resolve_publish(cfg: dict) -> dict:
     return info
 
 
+def llm_gguf_dir(cfg: dict) -> Path:
+    custom = (cfg.get("LLM_GGUF_MODELS_DIR", "") or "").strip()
+    if custom:
+        return Path(custom)
+    return ROOT / "user_data" / "models" / "llm"
+
+
+def llm_gguf_model_path(cfg: dict):
+    """Pick the GGUF chat model to serve: LLM_GGUF_MODEL by name, else the
+    first *.gguf in the models folder (auto-detect). mmproj files are ASR
+    projection models, not chat models, so they are skipped."""
+    base = llm_gguf_dir(cfg)
+    if not base.is_dir():
+        return None
+    wanted = (cfg.get("LLM_GGUF_MODEL", "") or "").strip()
+    first = None
+    try:
+        entries = sorted(base.glob("*.gguf"))
+    except OSError:
+        return None
+    for f in entries:
+        if f.name.lower().startswith("mmproj"):
+            continue
+        if wanted and f.name == wanted:
+            return f
+        if first is None:
+            first = f
+    return first if not wanted else None
+
+
+def llm_gguf_url(cfg: dict) -> str:
+    base = (cfg.get("LLM_GGUF_SERVER", "") or "").strip()
+    if base:
+        return base.rstrip("/")
+    port = _num(cfg, "LLM_GGUF_PORT", "8899", int)
+    return f"http://127.0.0.1:{port}/v1"
+
+
 def resolve_llm(cfg: dict, probe=None) -> dict:
     probe = probe or http_json_ok
     base = (cfg.get("LLM_BASE_URL", "") or "").strip()
     key = (cfg.get("LLM_API_KEY", "") or "").strip()
     model = (cfg.get("LLM_MODEL", "") or "").strip()
+    engine = (cfg.get("LLM_ENGINE", "") or "").strip().lower()
+    if engine == "gguf":
+        return {
+            "base_url": llm_gguf_url(cfg), "api_key": "",
+            "model": model or "local-gguf",
+            "kind": "local", "engine": "gguf",
+            "source": "config" if (cfg.get("LLM_GGUF_SERVER", "") or "").strip()
+                      else "managed",
+        }
     if base:
         kind = classify_endpoint(base)
         return {
             "base_url": base, "api_key": key, "model": model,
-            "kind": kind, "source": "config",
+            "kind": kind, "engine": "api", "source": "config",
         }
     for cand in LOCAL_LLM_CANDIDATES:
         if probe(cand):
             return {
                 "base_url": cand, "api_key": "", "model": model,
-                "kind": "local", "source": "auto:" + cand,
+                "kind": "local", "engine": "api", "source": "auto:" + cand,
+            }
+    if llm_gguf_model_path(cfg) is not None:
+        cand = llm_gguf_url(cfg)
+        if probe(cand):
+            return {
+                "base_url": cand, "api_key": "", "model": model or "local-gguf",
+                "kind": "local", "engine": "gguf",
+                "source": "auto:managed-gguf",
             }
     cloud_key = key or (os.environ.get("OPENAI_API_KEY", "") or "").strip()
     if cloud_key:
         return {
             "base_url": "https://api.openai.com/v1", "api_key": cloud_key,
             "model": model or "gpt-4o-mini", "kind": "cloud",
-            "source": "fallback:openai",
+            "engine": "api", "source": "fallback:openai",
         }
     return {
         "base_url": "", "api_key": "", "model": model, "kind": "none",
-        "source": "none",
+        "engine": "", "source": "none",
     }
 
 

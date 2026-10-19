@@ -342,6 +342,7 @@ async function loadConfigForm() {
   if (last && loadProfiles()[last]) loadProfile(last);
   else markActiveProfileFromValues();
   refreshLlmModels();
+  refreshLlmGguf();
 }
 
 let modelFetchTimer = 0;
@@ -556,3 +557,272 @@ $("restartyes").addEventListener("click", async () => {
     btn.disabled = false;
   }
 });
+
+
+// ---------- GGUF chat model manager (llama.cpp) ----------
+
+let llmGgufPoll = 0;
+
+function fmtPct(done, total) {
+  if (!total) return done ? (done / 1e6).toFixed(0) + " MB" : "";
+  return (done / 1e6).toFixed(0) + " / " + (total / 1e6).toFixed(0) + " MB (" +
+    Math.min(100, Math.round(done * 100 / total)) + "%)";
+}
+
+async function refreshLlmGguf() {
+  const sel = $("llmggufmodels"), psel = $("llmggufpresets"), box = $("llmggufbox");
+  if (!sel) return;
+  try {
+    const d = await fetchJson("/api/models/llm");
+    sel.innerHTML = "";
+    if (!d.models.length) {
+      addOpt(sel, "", "(no GGUF models found - download one below)");
+    }
+    (d.models || []).forEach((m) => {
+      addOpt(sel, m.name,
+        m.name + " (" + m.size_mb + " MB)" + (m.selected ? "  \u2713 selected" : ""));
+    });
+    const cur = (d.models || []).find((m) => m.selected);
+    if (cur) sel.value = cur.name;
+    psel.innerHTML = '<option value="">Pick a model to download...</option>';
+    (d.presets || []).forEach((p) => {
+      addOpt(psel, p.id, p.id + " (~" + p.size_mb + " MB)" +
+        (p.local ? "  \u2713 downloaded" : ""));
+    });
+    const jobs = d.downloads || {};
+    const running = Object.entries(jobs).find(([, j]) => j.status === "running");
+    const errJob = Object.entries(jobs).find(([, j]) => j.status === "error");
+    let status = "engine: " + (d.engine === "gguf" ? "GGUF selected" :
+      "auto (GGUF used when no other LLM answers)") +
+      " \u00b7 " + d.dir;
+    if (running) status = "downloading " + running[0].replace("llm:", "") +
+      " \u2014 " + fmtPct(running[1].done, running[1].total);
+    else if (errJob) status = "download FAILED: " + (errJob[1].error || "unknown");
+    if (d.binary) status += " \u00b7 llama-server found";
+    else status += " \u00b7 llama-server MISSING (setup menu 7 downloads it)";
+    if (d.resolve && d.resolve.engine === "gguf") {
+      status += " \u00b7 ACTIVE: " + d.resolve.source;
+    }
+    box.textContent = status;
+    clearTimeout(llmGgufPoll);
+    if (running) llmGgufPoll = setTimeout(refreshLlmGguf, 1500);
+  } catch (e) {
+    box.textContent = "status unavailable - " + (e && e.message ? e.message : e);
+  }
+}
+
+$("llmggufrefresh").addEventListener("click", refreshLlmGguf);
+
+$("llmggufmodels").addEventListener("change", async () => {
+  const name = $("llmggufmodels").value;
+  if (!name) return;
+  try {
+    const r = await fetch("/api/models/llm", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "select", name }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
+    toast("Model '" + name + "' selected - applies to the next conversation");
+    $("llmggufbox").textContent = "selected " + name +
+      " - restart (Settings -> Restart) or start a new conversation";
+    if ($("cfg-LLM_ENGINE")) { $("cfg-LLM_ENGINE").value = "gguf"; scheduleAutoSave(); }
+  } catch (e) {
+    toast("Select failed: " + (e && e.message ? e.message : e));
+  }
+});
+
+$("llmggufdownload").addEventListener("click", async () => {
+  const id = $("llmggufpresets").value;
+  if (!id) { toast("Pick a model to download first"); return; }
+  const btn = $("llmggufdownload");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/models/llm", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "download", name: id }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || "HTTP " + r.status);
+    toast("Downloading " + id + " in the background...");
+    refreshLlmGguf();
+  } catch (e) {
+    toast("Download failed: " + (e && e.message ? e.message : e));
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("llmggufremove").addEventListener("click", async () => {
+  const name = $("llmggufmodels").value;
+  if (!name) { toast("No model selected"); return; }
+  openModal("confirmremove");
+  $("confirmremovetext").textContent =
+    "Delete " + name + " from disk? You can re-download it later.";
+  const yes = $("confirmremoveyes");
+  const handler = async () => {
+    yes.removeEventListener("click", handler);
+    closeModal("confirmremove");
+    try {
+      const r = await fetch("/api/models/llm", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "remove", name }),
+      });
+      const d = await r.json();
+      toast(d.ok ? "Removed " + name : "Remove failed: " + d.message);
+      refreshLlmGguf();
+    } catch (e) {
+      toast("Remove failed: " + (e && e.message ? e.message : e));
+    }
+  };
+  yes.addEventListener("click", handler);
+});
+
+// ---------- Microphone test ----------
+
+$("mictest").addEventListener("click", async () => {
+  const box = $("mictestbox"), btn = $("mictest");
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    box.textContent = "BLOCKED: navigator.mediaDevices is unavailable. " +
+      "This page is not a secure context - use http://127.0.0.1:8090 on this " +
+      "PC, or public mode (https tunnel) for phones over wifi.";
+    return;
+  }
+  btn.disabled = true;
+  const dev = (() => { try { return localStorage.getItem("micDeviceId") || ""; } catch (e) { return ""; } })();
+  const caps = {
+    echoCancellation: ($("cfg-CAP_ECHO_CANCEL") || {}).value !== "0",
+    noiseSuppression: ($("cfg-CAP_NOISE_SUPPRESS") || {}).value !== "0",
+    autoGainControl: ($("cfg-CAP_AUTO_GAIN") || {}).value !== "0",
+  };
+  box.textContent = "requesting microphone...";
+  let stream = null;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: Object.assign(caps, dev ? { deviceId: { exact: dev } } : {}),
+    });
+  } catch (e) {
+    box.textContent = "FAILED: " + micErrorText(e);
+    btn.disabled = false;
+    return;
+  }
+  let peak = 0;
+  try {
+    const ctx = getCtx("mic");
+    const src = ctx.createMediaStreamSource(stream);
+    const an = ctx.createAnalyser();
+    an.fftSize = 256;
+    src.connect(an);
+    const buf = new Uint8Array(an.fftSize);
+    const t0 = Date.now();
+    await new Promise((done) => {
+      const tick = () => {
+        an.getByteTimeDomainData(buf);
+        for (let i = 0; i < buf.length; i++) {
+          peak = Math.max(peak, Math.abs(buf[i] - 128) / 128);
+        }
+        if (Date.now() - t0 >= 5000) { done(); return; }
+        box.textContent = "listening... speak now! level: " +
+          Math.round(peak * 100) + "%";
+        setTimeout(tick, 120);
+      };
+      tick();
+    });
+    const track = stream.getTracks()[0];
+    const label = track && track.label ? track.label : "(default device)";
+    if (peak > 0.02) {
+      box.textContent = "OK - mic works. peak " + Math.round(peak * 100) +
+        "% on: " + label + ". If calls still don't hear you, the issue is " +
+        "the STT engine, not the mic.";
+    } else {
+      box.textContent = "Mic opened (" + label + ") but 5s of SILENCE was " +
+        "captured. Check: correct input device in system sound settings, " +
+        "Windows Settings > Privacy > Microphone (allow desktop apps), " +
+        "and the physical mute switch.";
+    }
+  } catch (e) {
+    box.textContent = "test error: " + (e && e.message ? e.message : e);
+  } finally {
+    try { stream && stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+    btn.disabled = false;
+  }
+});
+
+// ---------- Module manager (see + remove optional components) ----------
+
+async function scanModules() {
+  const list = $("modlist");
+  list.textContent = "scanning...";
+  let d;
+  try {
+    d = await fetchJson("/api/modules");
+  } catch (e) {
+    list.textContent = "scan failed - " + (e && e.message ? e.message : e);
+    return;
+  }
+  list.innerHTML = "";
+  if (!d.modules || !d.modules.length) {
+    list.textContent = "no modules found";
+    return;
+  }
+  d.modules.forEach((m) => {
+    const row = document.createElement("div");
+    row.className = "modrow" + (m.installed ? "" : " modoff");
+    const st = document.createElement("span");
+    st.className = "modstate " + (m.installed ? "on" : "off");
+    st.textContent = m.installed ? "installed" : "not installed";
+    const name = document.createElement("span");
+    name.className = "modname";
+    name.textContent = m.name;
+    const meta = document.createElement("span");
+    meta.className = "modmeta";
+    const size = m.size_mb ? " ~" + m.size_mb + " MB" : "";
+    meta.textContent = m.uses + (size ? " \u00b7" + size : "") +
+      (m.in_use ? " \u00b7 IN USE: " + m.in_use : "") +
+      (m.installed ? "" : " \u00b7 reinstall: " + m.reinstall);
+    row.appendChild(st); row.appendChild(name); row.appendChild(meta);
+    if (m.installed && m.id !== "livekit-server") {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "modbtn";
+      btn.textContent = "remove";
+      if (m.in_use) btn.title = "In use - switch the engine in Settings first";
+      btn.addEventListener("click", () => removeModuleConfirm(m));
+      row.appendChild(btn);
+    }
+    list.appendChild(row);
+  });
+}
+
+function removeModuleConfirm(m) {
+  openModal("confirmremove");
+  $("confirmremovetext").textContent = m.in_use
+    ? m.name + " is IN USE (" + m.in_use + "). Removing it will break that "
+      + "engine until you reinstall or switch. Remove anyway? (the server "
+      + "refuses if it would break the active engine)"
+    : "Remove " + m.name + " from this installation? Your settings in "
+      + ".env.local are kept; you can reinstall via " + m.reinstall + ".";
+  const yes = $("confirmremoveyes");
+  const handler = async () => {
+    yes.removeEventListener("click", handler);
+    closeModal("confirmremove");
+    $("modlist").textContent = "removing " + m.name + "...";
+    try {
+      const r = await fetch("/api/modules/remove", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: m.id }),
+      });
+      const d = await r.json();
+      toast(d.ok ? d.message : "Remove failed: " + d.message);
+    } catch (e) {
+      toast("Remove failed: " + (e && e.message ? e.message : e));
+    }
+    scanModules();
+  };
+  yes.addEventListener("click", handler);
+}
+
+$("modscan").addEventListener("click", scanModules);
+
+$("confirmremoveno").addEventListener("click", () => closeModal("confirmremove"));
+$("confirmremoveno2").addEventListener("click", () => closeModal("confirmremove"));

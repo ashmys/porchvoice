@@ -1,24 +1,18 @@
 # PorchVoice
 
-A local-first realtime voice assistant that lives on your own hardware. Talk to it out loud, it listens, thinks, and answers with a natural voice. Speech-to-text and text-to-speech run locally by default, every provider URL is auto-detected (`http://` = local, `https://` = cloud, local always tried first), every API key is optional, and MCP tools plug in through a single URL. Built on the **livekit-agents 1.8.8 basic_agent pattern**.
+A local-first voice assistant for your own hardware. Press play in the app window and talk: speech recognition, the chat model, and the voice run on your machine by default, with cloud providers as an option — never a requirement.
 
 ```
-browser mic -> LiveKit -> Silero VAD -> Whisper STT (local, remote, or cloud)
-    -> LLM (auto-detected local OpenAI-compatible server, or cloud with a key)
-    -> Kokoro TTS (local, default) / Piper TTS (local) / OpenAI-compatible speech server (remote or cloud)
-    -> LiveKit -> browser speakers, with live transcripts and tool-call log
+browser mic ──► LiveKit ──► Silero VAD ──► STT ──► LLM ──► TTS ──► LiveKit ──► speakers
+                            (turn-taking)  │         │         │
+                        embedded Whisper   │   any OpenAI-   Kokoro-82M (default)
+                        Qwen3-ASR 0.6B GGUF│   compatible    Piper / remote server
+                        remote server      │   endpoint      (all optional)
 ```
 
-- **Agent**: canonical `WorkerOptions(entrypoint_fnc=entrypoint)` + `AgentSession` + `Agent` with `@function_tool` built-ins, matching the livekit-agents 1.8.8 basic_agent example
-- **STT**: embedded faster-whisper by default; **GGUF ASR** (`Qwen3-ASR 0.6B` on a local llama.cpp `llama-server` that PorchVoice starts and stops for you); or any whisper.cpp / faster-whisper / OpenAI-compatible `/audio/transcriptions` server via `STT_BASE_URL` + `STT_ENGINE=remote`
-- **LLM**: any OpenAI-compatible chat API — auto-detects Ollama, LM Studio, llama.cpp, text-generation-webui on localhost, falls back to a cloud endpoint when a key is set; a compatibility mode exists for minimal servers that reject tool calls; provider errors (bad key, usage limits, unreachable) are surfaced as red messages in the chat panel
-- **TTS**: embedded Kokoro-82M by default (Piper as the lightweight fallback); or any OpenAI-compatible `/audio/speech` server via `TTS_BASE_URL` + `TTS_ENGINE=remote`
-- **LiveKit credentials**: shipped defaults (`devkey` / a fixed dev secret) work with zero setup — key and secret are applied to the token endpoint, the agent worker, and `livekit.yaml` automatically; set `LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET` in `user_data/.env.local` only if you want your own, and the yaml follows
-- **Crash protection**: the supervisor stops restarting a child that fails with a fatal config error, and gives up after repeated fast crashes instead of looping forever; fix the setting and press *Settings → Restart*
-- **API keys**: encrypted at rest in `user_data/.env.local` (`enc:v1:...`), masked in the UI and API responses, with a show/hide toggle in Settings
-- **MCP**: one `MCP_URL` (streamable HTTP or SSE, auto-selected), optional bearer token, tools attached straight into the agent session
-- **Publish modes**: `local` (this machine), `wifi` (your LAN), `public` (cloudflared quick tunnel + `/lk` WebSocket proxy)
-- **UI**: single-page voice client — live audio visualization, conversation panel with text chat, tool-call log, full settings, browsable chat history
+- **Everything is optional and opt-in.** Only the LiveKit agent core is required; every STT/LLM/TTS engine and model is downloaded only if you choose it, and can be removed from the web UI or setup when you stop using it.
+- **GGUF all the way.** STT (Qwen3-ASR 0.6B), the chat LLM (Qwen3 and friends), and TTS (Kokoro 82M) can all run fully offline through a llama.cpp `llama-server` that PorchVoice starts and stops for you.
+- **One window.** `start.bat` / `start.sh` starts LiveKit, the agent, any managed model servers, and the UI; closing the window stops all of it.
 
 ---
 
@@ -27,156 +21,174 @@ browser mic -> LiveKit -> Silero VAD -> Whisper STT (local, remote, or cloud)
 | What | Minimum | Notes |
 |---|---|---|
 | OS | Windows 10/11 64-bit, Linux (Ubuntu 22.04+, Debian 12+, Fedora, Arch), macOS 12+ | |
-| Python | **3.11 or 3.12** | Windows: check *"Add python.exe to PATH"*. Linux: needs `python3-venv`/`python3-pip`. |
-| RAM | 8 GB recommended | Whisper + the browser both use RAM. |
-| Disk | 2–6 GB free | Whisper model (80 MB – 3 GB) + Piper voice (~60 MB) + packages. |
-| GPU | Optional | NVIDIA speeds up Whisper via CUDA. CPU is fine for `tiny`/`base`/`small`. |
-| An LLM endpoint | Anything that speaks the OpenAI chat API | Local (Ollama / LM Studio / llama.cpp / textgen webui) needs no key. Cloud needs a key. |
-| Browser | Chrome, Edge, or Firefox | Microphone permission required. |
-| Free ports | 8090, 7880, 7881, 50000–50100 | |
-| Internet | Only for setup downloads, cloud providers, and public mode | Everything runs offline once set up. |
+| Python | **3.11 or 3.12** | Windows: tick *"Add python.exe to PATH"*. Linux: needs `python3-venv`. |
+| RAM / Disk | 8 GB RAM, 2–6 GB free disk | Depends on the engines and models you pick. |
+| GPU | Optional | NVIDIA helps Whisper (CUDA) and GGUF models. CPU works for small models. |
+| An LLM endpoint | Any OpenAI-compatible API — or a downloaded GGUF model | Local endpoints need no key. |
+| Browser | Chrome, Edge, Brave, or Firefox | Mic permission required (auto-granted in the app window). |
+| Free ports | 8090, 7880, 7881, 8900, 8899, 50000–50100 | 8900/8899 are used only when the GGUF engines run. |
+| Internet | Only for setup downloads, cloud providers, public mode | Runs offline after setup. |
 
----
+## 2. Quick start
 
-## 2. Setup
+**Windows:** install Python 3.11/3.12 → double-click `setup.bat` → double-click `start.bat` → the app window opens at `http://127.0.0.1:8090`, press play, talk.
 
-### Windows 11 / 10
-
-1. Install Python 3.11 or 3.12 from [python.org](https://www.python.org/downloads/), ticking **"Add python.exe to PATH"**.
-2. Double-click **`setup.bat`**. The wizard offers:
-   - `1` Python venv + packages
-   - `2` LiveKit server download
-   - `3` Configuration — LLM URL/key (blank = auto-detect local first), MCP URL + bearer token, publish mode (local mode needs no publish setup)
-   - `4` Whisper STT model pre-download + GPU test
-   - `5` Voice engine — Kokoro (default, ~340 MB) or Piper voice
-   - `6` cloudflared (only needed for `public` publish mode; skipped automatically for local)
-   - `7` GGUF ASR — Qwen3-ASR 0.6B (~1 GB) + llama.cpp `llama-server` for GGUF speech-to-text
-3. Double-click **`start.bat`** and open `http://127.0.0.1:8090`.
-
-### Linux / macOS
+**Linux / macOS:**
 
 ```bash
-./setup.sh      # same wizard, same menu
-./start.sh      # one window starts LiveKit + agent + web UI
+./setup.sh     # wizard, menu below
+./start.sh     # LiveKit + agent + UI in one window
 ```
 
-Then open `http://127.0.0.1:8090`, press play, and talk.
+### Setup wizard menu
 
----
-
-## 3. Publish modes
-
-Set `PUBLISH_MODE` in `user_data/.env.local` (or the settings panel, then restart):
-
-| Mode | Who can connect | What happens |
+| Option | What it does | Downloads |
 |---|---|---|
-| `local` | This computer only | UI binds `127.0.0.1:8090`; LiveKit binds the loopback. Default and fully private. |
-| `wifi` | Devices on your LAN | UI binds `0.0.0.0:8090`; the token endpoint hands LAN clients `ws://<lan-ip>:7880`. Allow the ports through your firewall. |
-| `public` | Anyone with the link | Also starts a **cloudflared quick tunnel** (`https://<random>.trycloudflare.com`). Remote browsers load the UI over HTTPS and reach LiveKit signaling through this server's **`/lk` WebSocket proxy** (`wss://<tunnel>/lk/rtc -> ws://127.0.0.1:7880/rtc`). |
+| `1` | Python venv + **core** packages | ~150 MB (livekit-agents, aiohttp, dotenv) |
+| `2` | LiveKit server binary into `bin/` | ~30 MB |
+| `3` | Configuration (LLM, MCP, publish mode). **Your existing settings are shown as the default answer and are kept unless you type something new** — re-running setup never overwrites your config. | — |
+| `4` | Embedded Whisper model + GPU test (asks before downloading) | 80 MB – 3 GB |
+| `5` | TTS voice: Kokoro (default) or Piper (asks) | ~340 MB / ~60 MB |
+| `6` | cloudflared, only for `public` publish mode | ~20 MB |
+| `7` | **GGUF ASR**: Qwen3-ASR 0.6B + llama.cpp `llama-server` (asks) | ~1 GB |
+| `8` | **GGUF LLM**: pick and download a chat model (asks); auto-detects models already in the folder | 0.4 – 2.5 GB |
+| `9` | Optional python modules — install only the engines you want (Kokoro / Whisper / Piper / MCP / CUDA libs) | varies |
+| `10` | **Remove** unused modules / models / binaries to free disk space | frees space |
+| `0` | Run all steps (each download still asks first) | |
 
-Notes on `public` mode:
+Nothing beyond option `1`+`2` is mandatory. Skip the rest and add engines later from the wizard, the web UI, or — for GGUF models — simply drop any `.gguf` file into the model folder and it is auto-detected.
 
-- Quick tunnels are ephemeral: the URL changes on every start and is shown in the console, in `/health`, `/api/publish`, and the settings panel.
-- WebRTC media does not ride HTTP tunnels. Far-away listeners therefore need UDP `50000-50100` forwarded on your router (the generated `livekit.yaml` already advertises the external IP), or a TURN server. On the same LAN, media flows directly.
-- The tunnel runs only while PorchVoice runs; closing the window stops everything.
+## 3. Engines: how to pick what runs
 
----
+All engine settings live in the web UI (gear icon) and `user_data/.env.local`. Changes apply to the **next** conversation; *Settings → Restart LiveKit + agent* applies model-server changes immediately.
 
-## 4. Providers and auto-detection
+### LLM
 
-Every provider follows the same rule: **a `http://` base URL counts as local, `https://` counts as cloud, and local is always tried first.** API keys are optional everywhere; local servers never need one.
+| Setting | Behavior |
+|---|---|
+| `LLM_BASE_URL` set | Use that server (Ollama, LM Studio, llama.cpp, textgen, OpenRouter, OpenAI...). `http://` = local, `https://` = cloud. |
+| empty + `LLM_ENGINE` empty (auto) | Probe Ollama `:11434/v1`, LM Studio `:1234/v1`, llama.cpp `:8080/v1`, textgen `:5000/v1`; if none answer and a GGUF chat model exists, use it; if a key is set, fall back to OpenAI. |
+| `LLM_ENGINE=gguf` | **Managed GGUF LLM.** PorchVoice starts its own `llama-server` child on `LLM_GGUF_PORT` (8899) with the model from the models folder. No Ollama/LM Studio needed, fully offline. |
+| `LLM_GGUF_SERVER` set | Use an external llama-server instead of the managed child. |
 
-**LLM**
+**GGUF LLM models**: stored in `LLM_GGUF_MODELS_DIR` (default `user_data/models/llm/`). Any `.gguf` you drop in is auto-detected (the dropdown in Settings lists it). The download picker in Settings (or setup menu 8) offers:
 
-- `LLM_BASE_URL` empty → PorchVoice probes `http://127.0.0.1:11434/v1` (Ollama), `http://127.0.0.1:1234/v1` (LM Studio), `http://127.0.0.1:8080/v1` (llama.cpp), `http://127.0.0.1:5000/v1` (textgen) and uses the first that answers.
-- If none answer and `LLM_API_KEY` or `OPENAI_API_KEY` is set → `https://api.openai.com/v1`.
-- `LLM_COMPAT_MODE=1` swaps the tool-capable plugin for the minimal-payload adapter (for tiny local servers that choke on the `tools` parameter; MCP and built-in tools are disabled in that mode).
+| Model | Size | Notes |
+|---|---|---|
+| Qwen3-0.6B Q8_0 | ~640 MB | default — best small quality |
+| Qwen3-0.6B Q4_K_M | ~400 MB | smallest, fastest |
+| Qwen3-1.7B Q4_K_M | ~1.1 GB | smarter |
+| Qwen3-4B Q4_K_M | ~2.5 GB | much smarter; fits 6 GB GPUs |
+| Qwen2.5-0.5B Q4_K_M | ~420 MB | compact fallback |
 
-**STT**
+`LLM_COMPAT_MODE=1` sends minimal requests for servers that reject tool calling (disables tools). Downloads run in the background from the UI with live progress; nothing downloads unless you press the button.
 
-- `STT_BASE_URL` empty (and `STT_ENGINE` not `remote`) → embedded faster-whisper (the model picked in setup).
-- `STT_ENGINE=gguf` → speech-to-text runs **Qwen3-ASR-0.6B GGUF** on a local llama.cpp `llama-server`:
-  - With `STT_GGUF_SERVER` empty, PorchVoice starts its own `llama-server` child (`bin/llama-server`, model files in `user_data/models/gguf-asr/`) on `STT_GGUF_PORT` (default 8900) and transcribes through `POST /v1/audio/transcriptions`.
-  - Point `STT_GGUF_SERVER` (e.g. `http://127.0.0.1:8900/v1`) at any running llama-server carrying an audio-capable GGUF (`-m model.gguf --mmproj mmproj-*.gguf`) to skip the managed child.
-  - Install the model + binary with `setup` menu option `7`; the RTX-class GPU path uses CUDA automatically when the downloaded build includes it.
-- Set `STT_BASE_URL` to any server exposing `POST {url}/audio/transcriptions` (whisper.cpp server `http://...:9000/v1`, faster-whisper-server, Groq, OpenAI). Key optional.
-- `STT_ENGINE=whisper` forces the embedded engine even when a URL is set; `STT_ENGINE=remote` forces the remote path.
+### STT (speech-to-text)
 
-**TTS**
+| Setting | Behavior |
+|---|---|
+| `STT_ENGINE` empty | Remote server if `STT_BASE_URL` is set, else embedded Whisper (if installed). |
+| `STT_ENGINE=gguf` | **Qwen3-ASR 0.6B GGUF** via the managed llama-server on port 8900 (external override: `STT_GGUF_SERVER`). Setup menu 7 installs model + binary. |
+| `STT_ENGINE=whisper` | Embedded faster-whisper (`WHISPER_MODEL`, GPU auto). |
+| `STT_ENGINE=remote` | Any whisper-compatible `POST {url}/audio/transcriptions` server. |
 
-- `TTS_ENGINE` = `kokoro` (default) / `piper` / `remote`.
-- Kokoro: embedded Kokoro-82M ONNX engine, models in `user_data/models/kokoro/`, voice picked by `KOKORO_VOICE` (`af_heart` by default). If the model is missing, PorchVoice falls back to Piper, then to a cloud endpoint when a key is set.
-- Piper: embedded Piper, voice picked by `TTS_VOICE` (the old default).
-- `TTS_BASE_URL` set (or `TTS_ENGINE=remote`) → any server exposing `POST {url}/audio/speech` (openedai-speech, piper wrappers, OpenAI). Key optional.
+### TTS (text-to-speech)
 
-**MCP**
+| Setting | Behavior |
+|---|---|
+| `TTS_ENGINE=kokoro` (default) | Embedded Kokoro-82M ONNX, voice `KOKORO_VOICE` (`af_heart`). |
+| `TTS_ENGINE=piper` | Embedded Piper, voice `TTS_VOICE`. |
+| `TTS_ENGINE=remote` | Any OpenAI-compatible `POST {url}/audio/speech` server. |
 
-- `MCP_URL` — a single MCP server URL. URLs ending in `/mcp` use streamable HTTP; anything else uses SSE (matching livekit-agents' auto-selection).
-- `MCP_AUTH_TOKEN` — optional; sent as `Authorization: Bearer <token>` on every request.
-- The agent attaches every tool the server exposes, announces them in the chat log, and reports each call (name, arguments, output) to the UI over a `tool-call` data topic.
+## 4. Modules: add and remove without bloat
 
----
+- **Installing**: setup menu `9` (or the interactive prompts of menu `1`) installs optional python packages only when you answer yes. Model files are always an explicit per-model choice.
+- **Checking**: *Settings → Advanced → Scan installed modules* lists every optional component (python packages, model files, binaries), what uses it, its disk size, and whether it is currently selected by an engine.
+- **Removing**: press *remove* next to an entry (web UI) or use setup menu `10`. Components actively selected by an engine are refused — switch the engine first (the UI says which). Removing a package or model never touches your settings in `.env.local`, so reinstalling restores the same behavior.
 
-## 5. Built-in agent tools
+## 5. Publish modes
 
-`python/agent.py` follows the basic_agent pattern: an `Assistant(Agent)` with instructions plus `@function_tool` methods. Two ship by default — `get_current_time` and `calculate` — and they are the template for adding your own. MCP tools join the same tool list automatically, so the LLM can interleave them freely.
+| Mode | Who can connect | Details |
+|---|---|---|
+| `local` (default) | this PC only | UI on `127.0.0.1:8090`, LiveKit on loopback. Private. |
+| `wifi` | devices on your LAN | Binds `0.0.0.0`; token endpoint hands clients `ws://<lan-ip>:7880`. Open the firewall ports. |
+| `public` | anyone with the link | Starts a cloudflared quick tunnel (URL changes each run, shown in console + settings). Signaling rides `wss://<tunnel>/lk`; media needs UDP 50000-50100 forwarded or a TURN server. |
 
----
+**Microphones and http:** browsers only expose the mic on `localhost` or HTTPS. On this PC (`127.0.0.1:8090`) it always works; in `wifi` mode the desktop app window is launched with the LAN origin treated as secure, but **phones on plain http have no mic API — use `public` mode (https tunnel) for them.**
 
-## 6. Architecture
+## 6. Microphone troubleshooting
 
-```
-start.sh / start.bat
-  └─ python/server.py            one-window supervisor + web UI/API (aiohttp)
-       ├─ bin/livekit-server     child, auto-restart, yaml written per publish mode
-       ├─ python/agent.py        child, livekit-agents 1.8.8 worker (start mode)
-       │    ├─ AgentSession(stt=, llm=, tts=, vad=, tools=[MCPToolset])
-       │    ├─ Assistant(Agent) with @function_tool built-ins
-       │    ├─ providers: config auto-detect (local-first) -> remote/embedded engines
-       │    └─ TranscriptHub: transcript + tool-call data topics, .jsonl chat log
-       ├─ bin/llama-server       child, only when STT_ENGINE=gguf (Qwen3-ASR GGUF)
-       ├─ cloudflared            child, only in public mode (quick tunnel)
-       └─ web UI                 python/web/*, incl. /lk WS+HTTP proxy routes
-```
+The mic is the most common failure point, so PorchVoice diagnoses it for you:
 
-Chat history lands in `user_data/chat/<timestamp>-<room>.jsonl` (one file per room, fsynced on every record). The settings panel writes `user_data/.env.local`; changes apply to the next conversation.
+- **Mic test** — *Settings → Speech → test microphone (5s)*: opens the exact device/constraints used by calls, shows the live input level, and names the device. Level > 2% means the mic works and a silent call is an STT/engine problem, not the mic.
+- **Precheck before every call** — pressing play runs the same capture request first and translates every failure into plain language: permission denied (how to fix in the address bar + Windows privacy settings), device missing, mic held by another app (Discord/Zoom/OBS), or insecure context (wifi/phone case above).
+- **App window** — when the app opens in its own browser profile (`UI_PROFILE=1`, the default), PorchVoice pre-grants microphone permission to the app origin, so there is no prompt to miss and no silent block after a past "deny".
+- **Silence watchdog** — if the mic track is live but 6 seconds pass with zero signal, a toast reminds you to check the input device / OS privacy switch.
 
-## 7. Configuration reference (user_data/.env.local)
+If the test passes but the assistant still doesn't react: check the STT line in the startup banner and press *check status* in Settings — the STT section shows the resolved engine and whether its server answers.
+
+## 7. Configuration reference (`user_data/.env.local`)
+
+API keys are stored encrypted (`enc:v1:...`) and masked in the UI. Empty values fall back to the defaults below. The web UI writes the same file.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `LIVEKIT_URL` | `ws://127.0.0.1:7880` | LiveKit server URL |
-| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | `devkey` / built-in dev secret | Optional overrides; defaults are applied automatically everywhere (tokens, agent worker, `livekit.yaml`) |
+| `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | `devkey` / built-in dev secret | Optional override; applied to tokens, agent worker, and `livekit.yaml` automatically |
 | `PUBLISH_MODE` | `local` | `local` / `wifi` / `public` |
-| `LLM_BASE_URL` | *(empty)* | OpenAI-compatible base URL; empty = auto-detect local first |
-| `LLM_API_KEY` | *(empty)* | Optional; stored encrypted (`enc:v1:...`) in this file |
-| `LLM_MODEL` | *(empty)* | Model id; empty = server default |
-| `LLM_COMPAT_MODE` | `0` | `1` = minimal payloads, no tool calling |
-| `STT_ENGINE` | *(empty)* | *(empty)* = auto, `whisper` = embedded, `gguf` = Qwen3-ASR GGUF via llama.cpp, `remote` = server |
-| `STT_BASE_URL` / `STT_API_KEY` / `STT_MODEL` | *(empty)* | Remote STT server; empty = embedded Whisper |
-| `STT_GGUF_SERVER` | *(empty)* | Empty = PorchVoice manages its own llama-server; or a full base URL |
-| `STT_GGUF_PORT` / `STT_GGUF_MODEL` | `8900` / `Qwen3-ASR-0.6B-Q8_0.gguf` | Managed GGUF ASR server port / model file name in `user_data/models/gguf-asr/` |
-| `TTS_ENGINE` | `kokoro` | `kokoro` / `piper` / `remote` |
-| `KOKORO_VOICE` | `af_heart` | Embedded Kokoro voice |
-| `TTS_BASE_URL` / `TTS_API_KEY` / `TTS_MODEL` | *(empty)* | Remote TTS server |
-| `MCP_URL` | *(empty)* | Single MCP server URL (`/mcp` suffix = streamable HTTP) |
-| `MCP_AUTH_TOKEN` | *(empty)* | Optional bearer token for MCP; stored encrypted |
-| `MCP_TIMEOUT` | `5` | MCP request timeout in seconds |
-| `WHISPER_*` | `small`… | Embedded Whisper engine settings |
-| `TTS_VOICE` / `TTS_SPEED` | `en_US-amy-medium.onnx` / `1.1` | Embedded Piper engine settings |
-| `VAD_*` / `ENDPOINTING_DELAY` / `ECHO_GUARD*` | see defaults | Turn-taking and echo protection |
-| `UI_WINDOW` / `AUTO_OPEN` / `CLOSE_WITH_WINDOW` | `1` | Desktop app-window behavior |
+| `LLM_ENGINE` | *(empty)* | *(empty)* = auto, `gguf` = managed llama.cpp model, `api` = API servers only |
+| `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | *(empty)* | OpenAI-compatible endpoint; empty = auto-detect |
+| `LLM_COMPAT_MODE` / `LLM_STREAMING` | `0` / `1` | Minimal payloads / token streaming |
+| `LLM_THINKING` / `LLM_SPEAK_THINKING` | `0` / `0` | Show (and optionally speak) the model's thinking |
+| `LLM_GGUF_SERVER` | *(empty)* | External llama-server URL; empty = managed child |
+| `LLM_GGUF_PORT` | `8899` | Managed GGUF LLM port |
+| `LLM_GGUF_MODEL` | *(empty)* | Model filename; empty = first `*.gguf` in the folder |
+| `LLM_GGUF_MODELS_DIR` | *(empty)* | Custom model folder (auto-detected); empty = `user_data/models/llm` |
+| `LLM_GGUF_NGL` / `LLM_GGUF_CTX` | `99` / `4096` | GPU layers / context size for the managed LLM |
+| `STT_ENGINE` | *(empty)* | *(empty)* = auto, `whisper`, `gguf`, `remote` |
+| `STT_GGUF_SERVER` / `STT_GGUF_PORT` / `STT_GGUF_MODEL` | *(empty)* / `8900` / `Qwen3-ASR-0.6B-Q8_0.gguf` | GGUF ASR server settings |
+| `STT_BASE_URL` / `STT_API_KEY` / `STT_MODEL` | *(empty)* | Remote whisper-compatible server |
+| `WHISPER_MODEL` / `WHISPER_DEVICE` / `WHISPER_COMPUTE` | `small` / `auto` / `auto` | Embedded Whisper settings |
+| `WHISPER_LANGUAGE` | `en` | `auto` often misfires on short sentences — set it |
+| `TTS_ENGINE` / `KOKORO_VOICE` / `TTS_VOICE` / `TTS_SPEED` | `kokoro` / `af_heart` / `en_US-amy-medium.onnx` / `1.1` | TTS engine settings |
+| `MCP_URL` / `MCP_AUTH_TOKEN` / `MCP_TIMEOUT` | *(empty)* / *(empty)* / `5` | MCP tools: one URL, optional bearer |
+| `VAD_MIN_SILENCE` / `VAD_ACTIVATION_THRESHOLD` / `ENDPOINTING_DELAY` | `0.55` / `0.45` / `0.7` | Turn-taking feel |
+| `ECHO_GUARD` / `ECHO_GUARD_TAIL` | `1` / `0.8` | Drops the assistant's own voice from the mic |
+| `CAP_ECHO_CANCEL` / `CAP_NOISE_SUPPRESS` / `CAP_AUTO_GAIN` | `1` | Browser capture processing (try Noise suppress Off if STT is inaccurate) |
+| `UI_WINDOW` / `UI_PROFILE` / `UI_BROWSER` / `AUTO_OPEN` | `1` / `1` / *(empty)* / `1` | App window behavior |
+| `CLOSE_WITH_WINDOW` | `1` | Closing the window stops everything |
+| `PUBLIC_PORT` | `8090` | Web UI/API port |
 
-## 8. Troubleshooting
+## 8. Architecture
 
-- **`python-dotenv could not parse statement` warnings** — older versions wrote two header lines without `#`. PorchVoice now repairs `user_data/.env.local` automatically at startup (the junk lines get commented out).
-- **`api_secret is required` / token 500 errors** — caused by empty `LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET` lines in `user_data/.env.local`. Fixed: empty values no longer wipe the built-in defaults, the agent worker receives the credentials directly, and `livekit.yaml` is re-synced to your key/secret at startup.
-- **Agent keeps restarting / stops retrying** — the supervisor no longer loops forever: a fatal config error stops the restarts immediately, and repeated fast crashes stop after a few attempts. Read the error, fix the setting in `user_data/.env.local` or the web UI, then press *Settings → Restart*.
-- **GGUF STT does not answer** — check the startup banner (`STT:` line) and the `stt-gguf` child in the console. Missing model files or `llama-server` → run setup step 7; or set `STT_GGUF_SERVER` to a llama-server you run yourself. `Settings → check status` shows the resolved engine.
-- **No reply from the bot** — the console prints the resolved LLM endpoint at startup (`LLM: ...`), and LLM failures now appear as red error bubbles in the conversation panel (bad key = 401, usage limit = 402/429, unreachable = connection). Press *check status* in Settings → Provider status to test every endpoint.
-- **API key hidden** — keys are stored encrypted and the settings form shows `••••`; press *show* next to a key field to reveal it.
-- **MCP tools not firing** — press *test connection* in settings; it lists the tools the server exposes. Remember `LLM_COMPAT_MODE=1` disables tool calling entirely.
-- **Public mode connects but no audio remotely** — forward UDP 50000–50100 on your router, or run a TURN server; the quick tunnel carries signaling and the web UI only.
-- **Whisper slow** — pick a smaller model in settings, or check the GPU line in the startup banner.
-- **Kokoro voice missing** — run setup step 5 again, or switch `TTS_ENGINE=piper` in Settings → Speech (Piper runs automatically when the Kokoro model files are absent).
-- **Port 8090 taken** — set `PUBLIC_PORT` in `user_data/.env.local`.
+```
+start.sh / start.bat
+  └─ python/server.py            one-window supervisor + web UI/API (aiohttp)
+       ├─ bin/livekit-server     child, auto-restart, yaml synced to your key/secret
+       ├─ python/agent.py        child, livekit-agents 1.8.8 worker
+       │    ├─ AgentSession(stt=, llm=, tts=, vad=, tools=[MCP...])
+       │    ├─ Assistant(Agent) with @function_tool built-ins (time, calculate)
+       │    └─ TranscriptHub: transcript + tool-call topics, .jsonl chat log
+       ├─ bin/llama-server       child on :8900 when STT_ENGINE=gguf (Qwen3-ASR)
+       ├─ bin/llama-server       child on :8899 when LLM_ENGINE=gguf (chat model)
+       ├─ cloudflared            child, only in public mode
+       └─ python/web/*           single-page UI, /lk WS+HTTP proxy for tunnels
+```
+
+**Where things live:** settings in `user_data/.env.local` · chat history in `user_data/chat/*.jsonl` · models in `user_data/models/{whisper,kokoro,piper,gguf-asr,llm}` · binaries in `bin/`. All of it is user data — safe to keep across updates.
+
+**Web API** (everything the UI uses, usable from scripts): `/health`, `/token`, `/api/config` (GET/POST), `/api/check`, `/api/models/{stt,tts,llm}` (GET) + `/api/models/llm` (POST: `select`/`download`/`remove`/`set_dir`), `/api/modules` (GET) + `/api/modules/remove` (POST), `/api/llm/models`, `/api/browsers`, `/api/publish`, `/api/mcp/status`, `/api/restart`, `/api/chat/*`.
+
+## 9. Troubleshooting
+
+- **Setup warns `python-dotenv could not parse statement`** — old versions wrote header lines without `#`. PorchVoice repairs the file automatically at startup.
+- **`api_secret is required` / token 500 / agent restart loop** — an empty `LIVEKIT_API_KEY`/`LIVEKIT_API_SECRET` line used to wipe the defaults. Empty values no longer override defaults, credentials are passed explicitly to the worker, and `livekit.yaml` is re-synced. A fatal config error stops the restart loop (so does a run of fast crashes); fix the setting and press *Settings → Restart*.
+- **Mic seems dead** — run the Mic test (section 6). Permission denied → address-bar icon → Allow; held by another app → close it; phone over wifi http → use `public` mode.
+- **No reply from the assistant** — LLM errors appear as red bubbles in the conversation panel (401 bad key, 402/429 quota/rate, unreachable). *Settings → check status* tests LiveKit, LLM, STT, TTS, and MCP in one click and shows the resolved endpoints.
+- **GGUF engine does not answer** — check the `stt-gguf` / `llm-gguf` lines in the console: missing model files or `llama-server` binary say exactly which setup menu to run, or point `*_GGUF_SERVER` at a server you run yourself.
+- **Downloaded model not detected** — it must sit in `LLM_GGUF_MODELS_DIR` (default `user_data/models/llm/`) and not start with `mmproj` (those are ASR projection files). The Detected models dropdown refreshes from disk.
+- **STT inaccurate** — set `WHISPER_LANGUAGE` explicitly, try a bigger model, or turn Noise suppress / Auto gain Off in Settings → Speech. Try the GGUF ASR engine — Qwen3-ASR handles names and jargon differently than Whisper.
+- **MCP tools not firing** — *test connection* in settings lists what the server exposes; `LLM_COMPAT_MODE=1` disables all tool calling.
+- **Public mode: connects but no audio remotely** — forward UDP 50000–50100 or set up TURN; the tunnel carries only signaling and the UI.
+- **Port already in use** — another PorchVoice window is open, or set `PUBLIC_PORT`. The GGUF ports are `STT_GGUF_PORT` / `LLM_GGUF_PORT`.
+- **Freeing disk space** — *Settings → Advanced → Scan installed modules* shows sizes; remove what you don't use, reinstall anytime via setup menu 9 or re-downloading the model.

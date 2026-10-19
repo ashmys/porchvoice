@@ -76,7 +76,14 @@ def create_stt(
     no_speech: float = 0.6,
 ):
     from livekit.agents import stt as lk_stt
-    from faster_whisper import WhisperModel
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as exc:
+        raise RuntimeError(
+            "Embedded Whisper is not installed (faster-whisper missing). "
+            "Install it with setup -> menu 9 (optional python modules), or "
+            "pick STT engine 'gguf' or a remote server in Settings."
+        ) from exc
 
     class BatchWhisperSTT(lk_stt.STT):
         def __init__(self) -> None:

@@ -51,16 +51,53 @@ async function precheck() {
     if (h.children && h.children.agent && h.children.agent !== "up") warn.push("agent worker: " + h.children.agent);
     if (h.llm && !String(h.llm.status || "").startsWith("up")) warn.push("LLM provider not resolved yet - set LLM_BASE_URL or an API key in settings");
     if (h.models) {
-      if (!Number(h.models.stt)) warn.push("no Whisper model downloaded yet - run setup or check settings");
-      if (!Number(h.models.tts)) warn.push("no Piper voice downloaded yet - run setup or check settings");
+      if (!Number(h.models.stt)) warn.push("no STT model downloaded yet - run setup (menu 4/7/9) or check settings");
+      if (!Number(h.models.tts)) warn.push("no TTS voice downloaded yet - run setup (menu 5) or check settings");
     }
   }
-  if (!fatal.length && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    fatal.push("microphone API unavailable: this page is NOT a secure context "
+      + "(plain http from another device). Use http://127.0.0.1:8090 on this "
+      + "PC, or public mode (https) for phones on wifi.");
+    return { fatal, warn };
+  }
+  if (!fatal.length) {
+    let caps = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
     try {
-      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const cr = await fetch("/api/config");
+      if (cr.ok) {
+        const c = ((await cr.json()).config) || {};
+        caps = {
+          echoCancellation: c.CAP_ECHO_CANCEL !== "0",
+          noiseSuppression: c.CAP_NOISE_SUPPRESS !== "0",
+          autoGainControl: c.CAP_AUTO_GAIN !== "0",
+        };
+      }
+    } catch (e) {}
+    let dev;
+    try { dev = localStorage.getItem("micDeviceId") || ""; } catch (e) { dev = ""; }
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({
+        audio: Object.assign(caps, dev ? { deviceId: { exact: dev } } : {}),
+      });
       s.getTracks().forEach((t) => t.stop());
     } catch (e) {
-      fatal.push(micErrorText(e));
+      const name = e && e.name || "";
+      if (name === "NotFoundError" || name === "DevicesNotFoundError") {
+        fatal.push("no microphone found on this machine (or the saved input "
+          + "device is gone) - pick another input device in Settings > Speech");
+      } else if (name === "NotAllowedError" || name === "SecurityError") {
+        fatal.push("microphone permission denied. Click the padlock / sliders "
+          + "icon at the left of the address bar, set Microphone to Allow, "
+          + "then press play again. (Windows Settings > Privacy > Microphone "
+          + "must allow desktop apps too.)");
+      } else if (name === "NotReadableError" || name === "TrackStartError") {
+        fatal.push("the microphone is held by another app (Discord, Zoom, "
+          + "OBS, another browser window). Close it or pick another input "
+          + "device in Settings > Speech.");
+      } else {
+        fatal.push(micErrorText(e));
+      }
     }
   }
   return { fatal, warn };

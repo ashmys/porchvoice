@@ -91,6 +91,14 @@
             <select id="micdevice"><option value="">System default</option></select>
           </div>
           <div class="sect">Language model (OpenAI-compatible)</div>
+          <div class="field"><label>LLM engine</label>
+            <select id="cfg-LLM_ENGINE">
+              <option value="">Auto (URL, then local servers, then GGUF model)</option>
+              <option value="gguf">GGUF - local chat model via llama.cpp (below)</option>
+              <option value="api">API server only (URL / key above)</option>
+            </select>
+            <div class="hint">Auto keeps working like before. GGUF runs a small chat model fully offline: PorchVoice starts its own llama-server child on the port below. Models are downloaded on demand, never bundled.</div>
+          </div>
           <div class="field">
             <label>Provider profile <button type="button" class="minibtn" id="profsave" title="Store the current URL / model under this name">save</button> <button type="button" class="minibtn" id="profdelete" title="Delete the selected profile">delete</button></label>
             <div class="profilebox">
@@ -125,6 +133,31 @@
           <div class="field"><label>Speak the thinking out loud</label>
             <select id="cfg-LLM_SPEAK_THINKING"><option value="0">No (default - keep it silent)</option><option value="1">Yes (read the thinking before the answer)</option></select>
             <div class="hint">Only used when thinking mode is on. Off keeps the thinking text silent and on-screen only.</div>
+          </div>
+          <div class="sect">GGUF chat model (llama.cpp, runs offline)</div>
+          <div class="grid2">
+            <div class="field"><label>GGUF server URL (optional)</label>
+              <input type="text" id="cfg-LLM_GGUF_SERVER" placeholder="empty = PorchVoice runs its own llama-server">
+              <div class="hint">Leave empty to let PorchVoice start llama-server (port below). Or point it at an existing server, e.g. http://127.0.0.1:8080/v1</div>
+            </div>
+            <div class="field"><label>GGUF port</label>
+              <input type="text" id="cfg-LLM_GGUF_PORT" placeholder="8899">
+            </div>
+          </div>
+          <div class="field"><label>Model folder (any *.gguf you drop in is auto-detected)</label>
+            <input type="text" id="cfg-LLM_GGUF_MODELS_DIR" placeholder="empty = user_data/models/llm">
+            <div class="hint">Point this at your existing GGUF collection (LM Studio, llama.cpp, Ollama models) to reuse models you already have - nothing is copied or re-downloaded.</div>
+          </div>
+          <div class="field"><label>Detected models</label>
+            <select id="llmggufmodels"><option value="">Loading...</option></select>
+            <div class="hint">Pick one to serve it. "Selected" marks the model that will run on the next conversation.</div>
+          </div>
+          <div class="field"><label>Download a model <button type="button" class="minibtn" id="llmggufrefresh">refresh</button></label>
+            <select id="llmggufpresets"><option value="">Pick a model to download...</option></select>
+            <button class="minibtn" id="llmggufdownload" type="button">download</button>
+            <button class="minibtn dangerbtn" id="llmggufremove" type="button">remove selected model file</button>
+            <div class="pubbox" id="llmggufbox">status unknown</div>
+            <div class="hint">Downloads go to the model folder above with progress shown in the status line. Nothing downloads unless you press the button.</div>
           </div>
           <div class="sect">MCP tools (one server URL)</div>
           <div class="field"><label>MCP URL</label>
@@ -226,6 +259,10 @@
               <select id="cfg-CAP_AUTO_GAIN"><option value="1">On</option><option value="0">Off</option></select>
             </div>
           </div>
+          <div class="field"><label>Mic test <button type="button" class="minibtn" id="mictest">test microphone (5s)</button></label>
+            <div class="pubbox" id="mictestbox">Press the button and speak - this checks permission, level and the exact device used for calls.</div>
+            <div class="hint">If the test shows level but calls still fail, the problem is upstream (STT engine), not the mic. If permission was ever denied, the browser blocks silently - fix it in the padlock / site-settings icon of the address bar.</div>
+          </div>
           <div class="hint">Still inaccurate with every model size? The browser's noise suppression and auto-gain can mangle speech before Whisper sees it. Try <b>Noise suppress = Off</b> (and Auto gain = Off) - applies to the next call. Keep Echo cancel On unless you use headphones.</div>
           <div class="sect">Text-to-speech engine</div>
           <div class="field"><label>TTS engine</label>
@@ -290,6 +327,11 @@
             <button id="restartbtn" type="button">Restart LiveKit + agent</button>
             <div class="hint">Stops and restarts the LiveKit server and the agent worker with the current saved settings. Useful after a config change that does not want to apply, or if a service looks stuck. The conversation panel stays open.</div>
           </div>
+          <div class="sect">Modules (opt-in, remove what you don't use)</div>
+          <div class="field">
+            <button id="modscan" type="button">Scan installed modules</button>
+            <div id="modlist" class="modlist">Press "Scan" to see every optional component, its size, and a remove button. Nothing is removed without pressing remove.</div>
+          </div>
           <div class="field"><label>Log level (needs agent restart)</label>
             <select id="cfg-LOG_LEVEL"><option value="DEBUG">DEBUG</option><option value="INFO">INFO</option><option value="WARNING">WARNING</option><option value="ERROR">ERROR</option></select>
           </div>
@@ -331,6 +373,19 @@
       <div class="savebar btnrow">
         <button id="restartno2" class="halfbtn" type="button">Cancel</button>
         <button id="restartyes" class="dangerbtn" type="button">Restart</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal" id="confirmremove">
+    <div class="modalbox small">
+      <div class="modalhead"><h2>Remove?</h2><button class="closebtn" id="confirmremoveno">&times;</button></div>
+      <div class="modalbody">
+        <p id="confirmremovetext">Remove this component?</p>
+      </div>
+      <div class="savebar btnrow">
+        <button id="confirmremoveno2" class="halfbtn" type="button">Cancel</button>
+        <button id="confirmremoveyes" class="dangerbtn" type="button">Remove</button>
       </div>
     </div>
   </div>

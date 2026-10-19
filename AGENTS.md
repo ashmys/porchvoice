@@ -47,6 +47,12 @@ tests/e2e_smoke.py     full smoke suite (config, providers, server, MCP, worker)
 
 - Local-first: empty provider URL auto-detects local servers before cloud;
   `http://` = local, `https://` = cloud.
+- Setup and the wizard never overwrite existing settings: current values in
+  `user_data/.env.local` are kept and shown as the prompt defaults; unknown
+  keys survive `write_env`.
+- Model downloads are opt-in: no python package or model file is fetched
+  without an explicit user choice (setup prompt or UI button). The module
+  manager refuses to remove a component an engine currently selects.
 - `user_data/.env.local` is the single settings store. API keys in it are
   encrypted (`enc:v1:...` via keyvault); plaintext reads stay transparent
   through `config.load_config`.

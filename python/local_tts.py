@@ -54,7 +54,14 @@ def create_piper_tts(*, voice_name: str = "en_US-amy-medium.onnx", speed: float 
             "into user_data/models/piper/"
         )
 
-    from piper import PiperVoice
+    try:
+        from piper import PiperVoice
+    except ImportError as exc:
+        raise RuntimeError(
+            "Piper TTS is not installed (piper-tts missing). Install it with "
+            "setup -> menu 9 (optional python modules), or switch TTS_ENGINE "
+            "to kokoro/remote in Settings."
+        ) from exc
 
     logger.info("Loading Piper voice: %s", voice_path)
     try:

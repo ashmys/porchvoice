@@ -42,7 +42,14 @@ def find_model() -> tuple[Path, Path] | None:
 
 
 def kokoro_ready() -> bool:
-    return find_model() is not None
+    if find_model() is None:
+        return False
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("kokoro_onnx") is not None
+    except Exception:
+        return False
 
 
 def voice_lang(voice: str) -> str:
@@ -59,7 +66,14 @@ def create_kokoro_tts(*, voice_name: str = "af_heart", speed: float = 1.0,
             "Run setup (voice step) or switch TTS_ENGINE to piper."
         )
 
-    from kokoro_onnx import Kokoro
+    try:
+        from kokoro_onnx import Kokoro
+    except ImportError as exc:
+        raise RuntimeError(
+            "Kokoro TTS is not installed (kokoro-onnx missing). Install it "
+            "with setup -> menu 9 (optional python modules), or switch "
+            "TTS_ENGINE to piper/remote in Settings."
+        ) from exc
 
     model_path, voices_path = paths
     logger.info("Loading Kokoro: %s", model_path)

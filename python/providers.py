@@ -13,9 +13,14 @@ def build_llm(cfg: dict, probe=None, on_error=None, on_reply=None,
     if sel["kind"] == "none":
         raise RuntimeError(
             "No LLM provider found. Set LLM_BASE_URL (any OpenAI-compatible "
-            "server, local http:// or cloud https://) or LLM_API_KEY/"
+            "server, local http:// or cloud https://), download a GGUF chat "
+            "model (setup menu 8 / Settings), or set LLM_API_KEY/"
             "OPENAI_API_KEY, then restart the agent."
         )
+    if sel.get("engine") == "gguf" and not (cfg.get("LLM_GGUF_SERVER", "") or "").strip():
+        # managed child: the supervisor starts llama-server right after the
+        # agent, give it a moment to come up before the first request
+        _wait_gguf_server(sel["base_url"], timeout=30.0)
     compat = str(cfg.get("LLM_COMPAT_MODE", "0")).strip() == "1"
     streaming = str(cfg.get("LLM_STREAMING", "1")).strip() == "1"
     thinking = str(cfg.get("LLM_THINKING", "0")).strip() == "1"

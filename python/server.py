@@ -39,6 +39,9 @@ from config import (
     CONFIG_DEFAULTS,
     detect_lan_ip,
     gguf_stt_url,
+    llm_gguf_dir,
+    llm_gguf_model_path,
+    llm_gguf_url,
     load_config,
     masked,
     publish_mode,
@@ -53,8 +56,10 @@ from mcp_client import probe_mcp
 SECRET_SENTINEL = "__saved__"
 
 GGUF_ASR_DIR = ROOT / "user_data" / "models" / "gguf-asr"
-LLAMA_SERVER_EXE = ROOT / "bin" / ("llama-server.exe" if os.name == "nt"
-                                   else "llama-server")
+KOKORO_DIR = ROOT / "user_data" / "models" / "kokoro"
+BIN_DIR = ROOT / "bin"
+LLAMA_SERVER_EXE = BIN_DIR / ("llama-server.exe" if os.name == "nt"
+                              else "llama-server")
 
 RESTART_MAX_CRASHES = 5
 FATAL_MARKERS = (
@@ -211,6 +216,43 @@ def mask_secrets(cfg: dict) -> dict:
         if out.get(k):
             out[k] = SECRET_SENTINEL
     return out
+
+
+def write_env_keys(updates: dict) -> bool:
+    """Persist a few KEY=value pairs into user_data/.env.local without
+    touching anything else (existing keys, comments and ordering survive)."""
+    try:
+        lines = ENV_FILE.read_text(encoding="utf-8", errors="replace") \
+            .splitlines() if ENV_FILE.is_file() else []
+    except OSError as exc:
+        log(f"could not read {ENV_FILE.name}: {exc}")
+        return False
+    pending = {str(k): str(v) for k, v in updates.items() if str(k)}
+    for k in list(pending):
+        if k in SECRET_KEYS and pending[k] and not is_encrypted(pending[k]):
+            pending[k] = encrypt_value(pending[k])
+    out = []
+    seen = set()
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k = stripped.split("=", 1)[0].strip()
+            if k in pending:
+                out.append(f"{k}={pending[k]}")
+                seen.add(k)
+                continue
+        out.append(line)
+    for k, v in pending.items():
+        if k not in seen:
+            out.append(f"{k}={v}")
+    try:
+        ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ENV_FILE.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+    except OSError as exc:
+        log(f"could not write {ENV_FILE.name}: {exc}")
+        return False
+    log("config updated: " + ", ".join(sorted(pending)))
+    return True
 
 
 def setting(key: str, default: str = "") -> str:
@@ -487,6 +529,140 @@ def current_mode() -> str:
 
 def bind_host() -> str:
     return "127.0.0.1" if current_mode() == "local" else "0.0.0.0"
+
+
+# ---- Managed GGUF LLM (llama.cpp llama-server, like the GGUF ASR child) ----
+
+LLM_GGUF_CATALOG = (
+    # id, repo on HuggingFace, filename pattern, approx size MB, note
+    ("Qwen3-0.6B-Q8_0.gguf", "Qwen/Qwen3-0.6B-GGUF", "Q8_0",
+     640, "best small default - great quality for a voice assistant"),
+    ("Qwen3-0.6B-Q4_K_M.gguf", "Qwen/Qwen3-0.6B-GGUF", "q4_k_m",
+     400, "smallest, fastest, a bit rougher"),
+    ("Qwen3-1.7B-Q4_K_M.gguf", "Qwen/Qwen3-1.7B-GGUF", "q4_k_m",
+     1100, "smarter, needs ~1.5 GB VRAM"),
+    ("Qwen3-4B-Q4_K_M.gguf", "Qwen/Qwen3-4B-GGUF", "q4_k_m",
+     2500, "much smarter, needs ~3 GB VRAM (6 GB GPUs are fine)"),
+    ("Qwen2.5-0.5B-Instruct-Q4_K_M.gguf", "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+     "q4_k_m", 420, "older compact fallback"),
+)
+
+
+def llm_gguf_cmd() -> tuple:
+    cfg = load_config()
+    engine = (cfg.get("LLM_ENGINE", "") or "").strip().lower()
+    if engine != "gguf":
+        return None, "LLM_ENGINE is not gguf"
+    base = (cfg.get("LLM_GGUF_SERVER", "") or "").strip()
+    if base:
+        return None, "LLM_GGUF_SERVER is set - using the external server"
+    exe = find_llama_server()
+    if not exe:
+        return None, ("llama-server binary not found (bin/llama-server or PATH) - "
+                      "run setup menu 7/8, or set LLM_GGUF_SERVER to an existing "
+                      "llama-server URL")
+    model = llm_gguf_model_path(cfg)
+    if model is None:
+        return None, (f"no chat GGUF model found in {llm_gguf_dir(cfg)} "
+                      "- download one via setup menu 8 or the web UI settings")
+    port = int(str(cfg.get("LLM_GGUF_PORT", "8899") or 8899))
+    ngl = str(cfg.get("LLM_GGUF_NGL", "99") or 99)
+    ctx = str(cfg.get("LLM_GGUF_CTX", "4096") or 4096)
+    argv = [exe, "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
+            "--ctx-size", ctx, "-ngl", ngl, "--no-webui"]
+    return argv, ""
+
+
+def llm_gguf_autostart(cfg: dict) -> bool:
+    """No explicit engine and no configured URL: auto-start the managed GGUF
+    LLM only when a model file exists and no other local LLM server answered."""
+    if (cfg.get("LLM_BASE_URL", "") or "").strip():
+        return False
+    if (cfg.get("LLM_API_KEY", "") or "").strip():
+        return False
+    if llm_gguf_model_path(cfg) is None:
+        return False
+    from config import LOCAL_LLM_CANDIDATES, http_json_ok
+
+    return not any(http_json_ok(c, timeout=0.6) for c in LOCAL_LLM_CANDIDATES)
+
+
+def start_gguf_llm() -> None:
+    cfg = load_config()
+    engine = (cfg.get("LLM_ENGINE", "") or "").strip().lower()
+    if engine != "gguf" and not llm_gguf_autostart(cfg):
+        return
+    argv, why = llm_gguf_cmd()
+    if argv is None:
+        if engine == "gguf":
+            log(f"[llm-gguf] not started: {why}")
+            log("[llm-gguf] FIX -> run setup menu 8 (GGUF LLM), or point "
+                "LLM_GGUF_SERVER at a running llama-server, or set LLM_BASE_URL")
+        return
+    _RESTART["llm-gguf"] = 3
+    spawn("llm-gguf", argv)
+    url = llm_gguf_url(cfg)
+    model = llm_gguf_model_path(cfg)
+    log(f"[llm-gguf] chat model {model.name if model else '?'} will answer at "
+        f"{url} (/v1/chat/completions)")
+
+
+# ---- Model download jobs (background, with progress for the web UI) ----
+
+DL_JOBS = {}  # name -> {"status": running|done|error, "done": int, "total": int, "error": str}
+
+
+def _dl_job_worker(job_key: str, url: str, dest: Path, min_bytes: int) -> None:
+    job = DL_JOBS[job_key]
+    try:
+        import setup_wizard
+
+        def _prog(written, total):
+            job["done"], job["total"] = written, total
+
+        setup_wizard.download_resumable(
+            url, dest, dest.name, min_bytes=min_bytes, progress_cb=_prog)
+        job["status"] = "done"
+        job["done"] = job["total"] = dest.stat().st_size
+        log(f"download finished: {dest.name}")
+    except Exception as exc:
+        job["status"] = "error"
+        job["error"] = str(exc)[:300]
+        log(f"download FAILED: {dest.name} ({exc})")
+
+
+def dl_job_snapshot() -> dict:
+    return {k: dict(v) for k, v in DL_JOBS.items()}
+
+
+def start_download_job(job_key: str, url: str, dest: Path,
+                       min_bytes: int = 100) -> dict:
+    if job_key in DL_JOBS and DL_JOBS[job_key].get("status") == "running":
+        return {"ok": False, "error": "download already running"}
+    DL_JOBS[job_key] = {"status": "running", "done": 0, "total": 0,
+                        "error": "", "file": dest.name,
+                        "started_at": time.strftime("%H:%M:%S")}
+    threading.Thread(target=_dl_job_worker, args=(job_key, url, dest, min_bytes),
+                     daemon=True, name=f"dl-{job_key}").start()
+    return {"ok": True}
+
+
+def hf_resolve_file(repo: str, pattern: str) -> tuple:
+    """Find the exact download URL for a quant inside a HF repo (the exact
+    file naming differs between repos; match case-insensitively)."""
+    import setup_wizard
+
+    try:
+        base = setup_wizard.pick_hf_endpoint(repo)
+        files = setup_wizard.hf_list_files(base, repo)
+    except SystemExit as exc:
+        raise LookupError(str(exc)) from None
+    p = pattern.lower()
+    for f in files:
+        name = f.get("path", "")
+        if name.lower().endswith(".gguf") and p in name.lower():
+            return f"{base}/{repo}/resolve/main/{name}", name
+    raise LookupError(f"no *.gguf matching '{pattern}' in {repo}")
 
 
 def start_quick_tunnel() -> None:
@@ -853,6 +1029,8 @@ async def api_config_post(request: web.Request) -> web.Response:
         "LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL",
         "LLM_COMPAT_MODE", "LLM_STREAMING",
         "LLM_THINKING", "LLM_SPEAK_THINKING",
+        "LLM_ENGINE", "LLM_GGUF_SERVER", "LLM_GGUF_PORT",
+        "LLM_GGUF_MODEL", "LLM_GGUF_MODELS_DIR", "LLM_GGUF_NGL", "LLM_GGUF_CTX",
         "STT_BASE_URL", "STT_API_KEY", "STT_MODEL", "STT_ENGINE",
         "STT_GGUF_SERVER", "STT_GGUF_PORT", "STT_GGUF_MODEL",
         "TTS_BASE_URL", "TTS_API_KEY", "TTS_MODEL",
@@ -1129,7 +1307,372 @@ def count_local_models() -> dict:
     if base.is_dir():
         stt = sum(1 for d in base.iterdir() if d.is_dir() and (d / "model.bin").is_file())
     tts = len(list(piper_dir().glob("*.onnx"))) if piper_dir().is_dir() else 0
-    return {"stt": stt, "tts": tts}
+    llm = 0
+    lbase = llm_gguf_dir(load_config())
+    if lbase.is_dir():
+        llm = sum(1 for f in lbase.glob("*.gguf")
+                  if not f.name.lower().startswith("mmproj"))
+    return {"stt": stt, "tts": tts, "llm": llm}
+
+
+# ---- Optional module manager (see what is installed, remove what is unused) ----
+
+def _pkg_installed(module_name: str) -> bool:
+    if not module_name:
+        return False
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
+def _dir_size_mb(path: Path) -> int:
+    total = 0
+    try:
+        for f in path.rglob("*"):
+            if f.is_file():
+                total += f.stat().st_size
+    except OSError:
+        pass
+    return round(total / 1e6)
+
+
+MODULES_CATALOG = (
+    # id, kind, display name, what uses it, how to reinstall
+    {
+        "id": "whisper-stt", "kind": "package", "pkgs": ["faster-whisper"],
+        "import": "faster_whisper", "name": "Embedded Whisper (STT)",
+        "uses": "STT engine 'whisper' / 'auto' without a server",
+        "reinstall": "setup menu 9 (optional python modules)",
+    },
+    {
+        "id": "kokoro-tts", "kind": "package", "pkgs": ["kokoro-onnx"],
+        "import": "kokoro_onnx", "name": "Kokoro TTS engine",
+        "uses": "TTS engine 'kokoro' (the default voice)",
+        "reinstall": "setup menu 9 (optional python modules)",
+    },
+    {
+        "id": "piper-tts", "kind": "package", "pkgs": ["piper-tts"],
+        "import": "piper", "name": "Piper TTS engine",
+        "uses": "TTS engine 'piper'",
+        "reinstall": "setup menu 9 (optional python modules)",
+    },
+    {
+        "id": "mcp", "kind": "package", "pkgs": ["mcp"],
+        "import": "mcp", "name": "MCP tool client",
+        "uses": "MCP_URL tool servers",
+        "reinstall": "setup menu 9 (optional python modules)",
+    },
+    {
+        "id": "gpu-libs", "kind": "package", "pkgs": ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"],
+        "import": "", "name": "NVIDIA CUDA/cuDNN runtime",
+        "uses": "GPU acceleration for Whisper (ctranslate2)",
+        "reinstall": "setup menu 9 (optional python modules)",
+    },
+    {
+        "id": "whisper-models", "kind": "files", "name": "Whisper model files",
+        "uses": "Embedded Whisper STT", "reinstall": "setup menu 4",
+    },
+    {
+        "id": "kokoro-model", "kind": "files", "name": "Kokoro voice model (~340 MB)",
+        "uses": "Kokoro TTS", "reinstall": "setup menu 5",
+    },
+    {
+        "id": "piper-voices", "kind": "files", "name": "Piper voice files",
+        "uses": "Piper TTS", "reinstall": "setup menu 5",
+    },
+    {
+        "id": "gguf-asr", "kind": "files", "name": "Qwen3-ASR 0.6B GGUF (~1 GB)",
+        "uses": "STT engine 'gguf'", "reinstall": "setup menu 7",
+    },
+    {
+        "id": "llm-gguf", "kind": "files", "name": "GGUF chat models",
+        "uses": "LLM engine 'gguf'", "reinstall": "setup menu 8 or the web UI",
+    },
+    {
+        "id": "llama-server", "kind": "files", "name": "llama.cpp llama-server binary",
+        "uses": "STT engine 'gguf' and LLM engine 'gguf'", "reinstall": "setup menu 7",
+    },
+    {
+        "id": "cloudflared", "kind": "files", "name": "cloudflared (public tunnel)",
+        "uses": "publish mode 'public'", "reinstall": "setup menu 6",
+    },
+    {
+        "id": "livekit-server", "kind": "files", "name": "LiveKit server binary",
+        "uses": "everything - do NOT remove unless you know why",
+        "reinstall": "setup menu 2",
+    },
+)
+
+
+def _module_files(mod_id: str) -> list:
+    out = []
+    if mod_id == "whisper-models":
+        base = whisper_dir()
+        if base.is_dir():
+            out = [d for d in sorted(base.iterdir()) if d.is_dir()]
+    elif mod_id == "kokoro-model":
+        base = KOKORO_DIR
+        out = [f for f in (base / "kokoro-v1.0.onnx", base / "voices-v1.0.bin")
+               if f.is_file()]
+    elif mod_id == "piper-voices":
+        base = piper_dir()
+        out = sorted(base.glob("*.onnx*")) if base.is_dir() else []
+    elif mod_id == "gguf-asr":
+        out = sorted(GGUF_ASR_DIR.glob("*.gguf")) if GGUF_ASR_DIR.is_dir() else []
+    elif mod_id == "llm-gguf":
+        base = llm_gguf_dir(load_config())
+        out = sorted(base.glob("*.gguf")) if base.is_dir() else []
+    elif mod_id == "llama-server":
+        p = LLAMA_SERVER_EXE
+        out = [p] if p.is_file() else []
+        for extra in BIN_DIR.glob("llama-*"):
+            if extra.is_file() and extra.name != LLAMA_SERVER_EXE.name:
+                out.append(extra)
+        for extra in BIN_DIR.glob("cudart-*"):
+            out.append(extra)
+    elif mod_id == "cloudflared":
+        p = CLOUDFLARED_EXE
+        out = [p] if p.is_file() else []
+    elif mod_id == "livekit-server":
+        p = LIVEKIT_EXE
+        out = [p] if p.is_file() else []
+    return [f for f in out if f.is_file() or f.is_dir()]
+
+
+def _module_in_use(mod_id: str) -> str:
+    """Return a reason string when removal would break the active config."""
+    cfg = load_config()
+    stt_engine = (cfg.get("STT_ENGINE", "") or "").strip().lower()
+    tts_engine = (cfg.get("TTS_ENGINE", "") or "").strip().lower()
+    llm_engine = (cfg.get("LLM_ENGINE", "") or "").strip().lower()
+    checks = {
+        "whisper-models": (stt_engine in ("", "whisper")
+                           and not (cfg.get("STT_BASE_URL", "") or "").strip(),
+                           "STT engine is embedded Whisper"),
+        "kokoro-model": (tts_engine in ("", "kokoro")
+                         and not (cfg.get("TTS_BASE_URL", "") or "").strip(),
+                         "TTS engine is Kokoro"),
+        "piper-voices": (tts_engine == "piper", "TTS engine is Piper"),
+        "gguf-asr": (stt_engine == "gguf", "STT engine is GGUF ASR"),
+        "llm-gguf": (llm_engine == "gguf", "LLM engine is GGUF"),
+        "llama-server": (stt_engine == "gguf" or llm_engine == "gguf",
+                         "a GGUF engine is selected"),
+        "cloudflared": (current_mode() == "public", "publish mode is public"),
+        "livekit-server": (True, "LiveKit is the core server"),
+    }
+    check = checks.get(mod_id)
+    if check and check[0]:
+        return check[1]
+    return ""
+
+
+def list_modules() -> list:
+    out = []
+    for mod in MODULES_CATALOG:
+        mid = mod["id"]
+        entry = {"id": mid, "name": mod["name"], "uses": mod.get("uses", ""),
+                 "reinstall": mod.get("reinstall", "")}
+        if mod["kind"] == "package":
+            entry["type"] = "python package"
+            installed = _pkg_installed(mod.get("import", ""))
+            entry["installed"] = installed
+            entry["pkgs"] = mod["pkgs"]
+            entry["size_mb"] = 0
+        else:
+            entry["type"] = "files"
+            files = _module_files(mid)
+            entry["installed"] = bool(files)
+            entry["files"] = [f.name for f in files][:40]
+            if mid == "whisper-models":
+                entry["size_mb"] = sum(_dir_size_mb(f) for f in files)
+            else:
+                entry["size_mb"] = round(sum(
+                    (f.stat().st_size if f.is_file() else _dir_size_mb(f))
+                    for f in files) / 1e6)
+        entry["in_use"] = _module_in_use(mid)
+        out.append(entry)
+    return out
+
+
+def remove_module(mod_id: str, target: str = "") -> tuple:
+    mod = next((m for m in MODULES_CATALOG if m["id"] == mod_id), None)
+    if mod is None:
+        return False, f"unknown module '{mod_id}'"
+    why = _module_in_use(mod_id)
+    if why:
+        return False, (f"'{mod['name']}' is in use: {why}. Switch the engine in "
+                       "Settings first, then remove it.")
+    if mod["kind"] == "package":
+        py = venv_python()
+        if not py.exists():
+            return False, ".venv missing - nothing to uninstall from"
+        code = subprocess.run(
+            [str(py), "-m", "pip", "uninstall", "-y", *mod["pkgs"]],
+            capture_output=True, text=True, timeout=300)
+        if code.returncode != 0:
+            return False, ("pip uninstall failed: "
+                           + (code.stderr or code.stdout or "")[-200:])
+        log(f"module removed: {mod['name']} (pip: {', '.join(mod['pkgs'])})")
+        return True, f"uninstalled {', '.join(mod['pkgs'])}"
+    files = _module_files(mod_id)
+    if target:
+        files = [f for f in files if f.name == target or str(f) == target]
+        if not files:
+            return False, f"no matching file '{target}' in {mod_id}"
+    removed = []
+    for f in files:
+        if mod_id == "llm-gguf" and not target:
+            cfg = load_config()
+            if f.name == (cfg.get("LLM_GGUF_MODEL", "") or "").strip():
+                write_env_keys({"LLM_GGUF_MODEL": ""})
+        try:
+            if f.is_dir():
+                shutil.rmtree(f)
+            else:
+                f.unlink()
+            removed.append(f.name)
+        except OSError as exc:
+            log(f"could not remove {f}: {exc}")
+    if mod_id == "llama-server" and not target:
+        for left in list(BIN_DIR.glob("llama-*")) + list(BIN_DIR.glob("cudart-*")):
+            try:
+                shutil.rmtree(left) if left.is_dir() else left.unlink()
+            except OSError:
+                pass
+    if not removed:
+        return False, "nothing to remove (already gone)"
+    log(f"module removed: {mod['name']} -> {', '.join(removed[:5])}"
+        + (" ..." if len(removed) > 5 else ""))
+    return True, f"removed {len(removed)} item(s)"
+
+
+async def api_modules(_request: web.Request) -> web.Response:
+    return web.json_response({"modules": list_modules(),
+                              "downloads": dl_job_snapshot()})
+
+
+async def api_modules_remove(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except ValueError:
+        return web.json_response({"error": "invalid json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "invalid json"}, status=400)
+    mod_id = str(body.get("id") or "")
+    target = str(body.get("target") or "")
+    ok, msg = await asyncio.to_thread(remove_module, mod_id, target)
+    status = 200 if ok else 400
+    return web.json_response({"ok": ok, "message": msg}, status=status)
+
+
+def _llm_preset_status() -> list:
+    cfg = load_config()
+    base = llm_gguf_dir(cfg)
+    presets = []
+    for pid, repo, pattern, mb, note in LLM_GGUF_CATALOG:
+        local = ""
+        if base.is_dir():
+            for f in sorted(base.glob("*.gguf")):
+                if pattern.lower() in f.name.lower() and \
+                        not f.name.lower().startswith("mmproj"):
+                    local = f.name
+                    break
+        presets.append({"id": pid, "repo": repo, "size_mb": mb, "note": note,
+                        "local_file": local, "local": bool(local)})
+    return presets
+
+
+def _llm_jobs_ok() -> bool:
+    return not any(j.get("status") == "running" for j in DL_JOBS.values())
+
+
+async def api_models_llm(_request: web.Request) -> web.Response:
+    cfg = load_config()
+    base = llm_gguf_dir(cfg)
+    models = []
+    selected = (cfg.get("LLM_GGUF_MODEL", "") or "").strip()
+    auto_pick = llm_gguf_model_path(cfg)
+    if base.is_dir():
+        for f in sorted(base.glob("*.gguf")):
+            if f.name.lower().startswith("mmproj"):
+                continue
+            try:
+                size_mb = round(f.stat().st_size / 1e6)
+            except OSError:
+                size_mb = 0
+            models.append({"name": f.name, "size_mb": size_mb,
+                           "selected": bool(selected and f.name == selected)
+                                       or (not selected and auto_pick
+                                           and f.name == auto_pick.name)})
+    sel = resolve_llm(cfg)
+    return web.json_response({
+        "dir": str(base),
+        "models": models,
+        "presets": _llm_preset_status(),
+        "server": llm_gguf_url(cfg),
+        "engine": (cfg.get("LLM_ENGINE", "") or "").strip().lower(),
+        "binary": find_llama_server(),
+        "resolve": {"base_url": sel["base_url"], "kind": sel["kind"],
+                    "engine": sel.get("engine", ""), "source": sel["source"]},
+        "downloads": dl_job_snapshot(),
+        "busy": not _llm_jobs_ok(),
+    })
+
+
+async def api_models_llm_post(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except ValueError:
+        return web.json_response({"error": "invalid json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response({"error": "invalid json"}, status=400)
+    action = str(body.get("action") or "")
+    name = str(body.get("name") or "")
+    if action == "select":
+        if not name:
+            return web.json_response({"error": "missing model name"}, status=400)
+        base = llm_gguf_dir(load_config())
+        if not (base / name).is_file() or not name.endswith(".gguf"):
+            return web.json_response({"error": "unknown model file"}, status=400)
+        write_env_keys({"LLM_GGUF_MODEL": name, "LLM_ENGINE": "gguf"})
+        return web.json_response({"ok": True, "selected": name,
+                                  "note": "restart the agent (Settings -> Restart)"
+                                          " or start the next conversation"})
+    if action == "download":
+        preset = next((p for p in LLM_GGUF_CATALOG if p[0] == name), None)
+        if preset is None:
+            return web.json_response({"error": "unknown preset"}, status=400)
+        pid, repo, pattern, _mb, _note = preset
+        if not _llm_jobs_ok():
+            return web.json_response({"error": "another download is running"},
+                                     status=409)
+        try:
+            url, real_name = await asyncio.to_thread(hf_resolve_file, repo, pattern)
+        except Exception as exc:
+            return web.json_response(
+                {"error": f"could not resolve {repo}: {str(exc)[:140]}"}, status=502)
+        dest = llm_gguf_dir(load_config()) / real_name
+        res = start_download_job(f"llm:{real_name}", url, dest,
+                                 min_bytes=50_000_000)
+        if not res.get("ok"):
+            return web.json_response({"error": res.get("error")}, status=409)
+        write_env_keys({"LLM_GGUF_MODEL": real_name})
+        log(f"[llm-gguf] downloading {real_name} from {repo} in the background")
+        return web.json_response({"ok": True, "file": real_name})
+    if action == "remove":
+        ok, msg = await asyncio.to_thread(remove_module, "llm-gguf", name)
+        return web.json_response({"ok": ok, "message": msg},
+                                 status=200 if ok else 400)
+    if action == "set_dir":
+        d = name.strip()
+        if d and not Path(d).is_dir():
+            return web.json_response({"error": "folder does not exist"}, status=400)
+        write_env_keys({"LLM_GGUF_MODELS_DIR": d})
+        return web.json_response({"ok": True, "dir": d})
+    return web.json_response({"error": "unknown action"}, status=400)
 
 
 async def health(_request: web.Request) -> web.Response:
@@ -1744,6 +2287,48 @@ def _spawn_browser(args: list) -> subprocess.Popen:
                             stderr=subprocess.DEVNULL, start_new_session=True)
 
 
+def _seed_mic_permission(prof: Path) -> None:
+    """Pre-grant microphone access to the app origin inside the dedicated
+    browser profile so the app window never shows (or silently swallows) a
+    permission prompt. Chromium stores per-origin grants in Preferences."""
+    try:
+        pref_dir = prof / "Default"
+        pref_dir.mkdir(parents=True, exist_ok=True)
+        pref_file = pref_dir / "Preferences"
+        data = {}
+        try:
+            if pref_file.is_file():
+                data = json.loads(pref_file.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        origins = {f"http://127.0.0.1:{PORT},*": {"setting": 1},
+                   f"http://localhost:{PORT},*": {"setting": 1}}
+        lan = detect_lan_ip()
+        origins[f"http://{lan}:{PORT},*"] = {"setting": 1}
+        if TUNNEL.get("url"):
+            origins[TUNNEL["url"] + ",*"] = {"setting": 1}
+        prof_root = data.setdefault("profile", {})
+        exceptions = prof_root.setdefault("content_settings", {}) \
+            .setdefault("exceptions", {})
+        mic = exceptions.setdefault("microphone", {})
+        for k, v in origins.items():
+            if k not in mic or mic[k].get("setting") != 1:
+                mic[k] = dict(v, expiration="0", last_modified=str(int(time.time())))
+        audio_capture = exceptions.setdefault("audio_capture_allowed", {})
+        for k, v in origins.items():
+            if k not in audio_capture:
+                audio_capture[k] = dict(v, expiration="0",
+                                        last_modified=str(int(time.time())))
+        prof_root.setdefault("content_settings", {})["pref_version"] = 1
+        tmp = pref_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, pref_file)
+        log("mic permission pre-granted for the app window profile "
+            "(no prompt, no silent block)")
+    except Exception as exc:
+        log(f"could not pre-grant mic permission ({exc}) - the browser will ask")
+
+
 def open_ui_when_ready() -> None:
     global _BROWSER, _BROWSER_JOBBED
     url = f"http://{HOST}:{PORT}/"
@@ -1775,6 +2360,14 @@ def open_ui_when_ready() -> None:
                             prof = ROOT / "user_data" / "browser-profile"
                             prof.mkdir(parents=True, exist_ok=True)
                             args.append(f"--user-data-dir={prof}")
+                            _seed_mic_permission(prof)
+                            if current_mode() != "local":
+                                # plain http LAN origins are not a secure
+                                # context - getUserMedia would be missing
+                                lan_url = f"http://{detect_lan_ip()}:{PORT}"
+                                args.append(
+                                    "--unsafely-treat-insecure-origin-as-secure="
+                                    + lan_url)
                     else:
                         args.append("--new-window")
                         args.append(url)
@@ -1867,6 +2460,10 @@ def build_app() -> web.Application:
     app.router.add_post("/api/reveal", api_reveal)
     app.router.add_get("/api/models/stt", api_models_stt)
     app.router.add_get("/api/models/tts", api_models_tts)
+    app.router.add_get("/api/models/llm", api_models_llm)
+    app.router.add_post("/api/models/llm", api_models_llm_post)
+    app.router.add_get("/api/modules", api_modules)
+    app.router.add_post("/api/modules/remove", api_modules_remove)
     app.router.add_get("/api/browsers", api_browsers)
     app.router.add_post("/api/llm/models", api_llm_models)
     app.router.add_get("/api/chat/sessions", api_chat_sessions)
@@ -1957,6 +2554,8 @@ def main() -> None:
     spawn("agent", [agent_python, "-u", AGENT_SCRIPT, "start"])
     threading.Thread(target=start_gguf_stt, daemon=True,
                      name="gguf-starter").start()
+    threading.Thread(target=start_gguf_llm, daemon=True,
+                     name="llm-gguf-starter").start()
 
     if current_mode() == "public":
         threading.Thread(target=start_quick_tunnel, daemon=True,

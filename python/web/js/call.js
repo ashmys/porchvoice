@@ -1,9 +1,28 @@
 "use strict";
 
 
+function micCaps(c) {
+  return {
+    echoCancellation: c.CAP_ECHO_CANCEL !== "0",
+    noiseSuppression: c.CAP_NOISE_SUPPRESS !== "0",
+    autoGainControl: c.CAP_AUTO_GAIN !== "0",
+  };
+}
+
+function micDeviceConstraint() {
+  try {
+    const dev = localStorage.getItem("micDeviceId") || "";
+    return dev ? { exact: dev } : undefined;
+  } catch (e) { return undefined; }
+}
+
 async function connect() {
   if (!window.LivekitClient) throw new Error("livekit-client.js missing");
-
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("this page is not a secure context, so the microphone API "
+      + "is unavailable. Open http://127.0.0.1:8090 on this PC, or use public "
+      + "mode (https tunnel) when calling from another device over wifi.");
+  }
 
   const wantRoom = savedRoom();
   const qs = wantRoom ? "&room=" + encodeURIComponent(wantRoom) : "";
@@ -25,19 +44,17 @@ async function connect() {
     const cr = await fetch("/api/config");
     if (cr.ok) {
       const c = ((await cr.json()).config) || {};
-      caps.echoCancellation = c.CAP_ECHO_CANCEL !== "0";
-      caps.noiseSuppression = c.CAP_NOISE_SUPPRESS !== "0";
-      caps.autoGainControl = c.CAP_AUTO_GAIN !== "0";
+      caps = micCaps(c);
     }
   } catch (e) {}
-  const dev = (() => { try { return localStorage.getItem("micDeviceId") || ""; } catch (e) { return ""; } })();
+  const dev = micDeviceConstraint();
   room = new LK.Room({
     adaptiveStream: false, dynacast: false,
     audioCaptureDefaults: {
       echoCancellation: caps.echoCancellation,
       noiseSuppression: caps.noiseSuppression,
       autoGainControl: caps.autoGainControl,
-      deviceId: dev ? { ideal: dev } : undefined,
+      deviceId: dev,
     },
   });
   room.on(LK.RoomEvent.DataReceived, (payload, participant, kind, topic) => {
@@ -91,6 +108,17 @@ async function connect() {
   } catch (e) {
     console.warn("prepareConnection skipped", e);
   }
+  // open the mic BEFORE the room connect: any permission / device error
+  // surfaces with a precise message instead of failing silently inside the
+  // LiveKit publish path
+  try {
+    const probe = await navigator.mediaDevices.getUserMedia({
+      audio: Object.assign({}, caps, dev ? { deviceId: dev } : {}),
+    });
+    probe.getTracks().forEach((t) => t.stop());
+  } catch (e) {
+    throw new Error("microphone blocked before connecting: " + micErrorText(e));
+  }
   await room.connect(d.url, d.token);
   try {
     await room.localParticipant.setMicrophoneEnabled(true);
@@ -100,6 +128,12 @@ async function connect() {
   const pub = room.localParticipant.getTrackPublication(LK.Track.Source.Microphone);
   if (!pub || !pub.track || !pub.track.mediaStreamTrack) {
     throw new Error("microphone track was not published - stop and start the call again");
+  }
+  const mst = pub.track.mediaStreamTrack;
+  if (mst.readyState !== "live" || pub.track.isMuted) {
+    throw new Error("the microphone track ended immediately (" + mst.readyState
+      + "). Another app may be holding the mic, or Windows blocked it - "
+      + "check Settings > Privacy > Microphone and the input device.");
   }
   micPubOk = true;
   micWarned = false;

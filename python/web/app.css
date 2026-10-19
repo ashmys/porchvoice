@@ -307,3 +307,19 @@ body.panel-open #status { left: calc(min(340px, 42vw) + 26px); }
 .profilebox select, .profilebox input { min-width: 0; }
 .profilebox select { flex: 1 1 45%; }
 .profilebox input { flex: 1 1 55%; }
+
+.modlist { display: flex; flex-direction: column; gap: 6px; max-height: 320px; overflow-y: auto; }
+.modrow { display: flex; gap: 8px; align-items: center; padding: 6px 9px;
+  border: 1px solid rgba(255,255,255,.08); border-radius: 9px;
+  background: rgba(255,255,255,.03); font-size: 12px; }
+.modrow .modname { font-weight: 600; color: var(--fg); }
+.modrow .modmeta { color: var(--dim); font-size: 11px; flex: 1 1 auto; }
+.modrow .modbtn { flex: 0 0 auto; font-size: 10.5px; cursor: pointer;
+  background: rgba(248,113,113,.08); border: 1px solid rgba(248,113,113,.3);
+  color: #fca5a5; border-radius: 8px; padding: 4px 9px; }
+.modrow .modbtn:disabled { opacity: .4; cursor: default; }
+.modrow.modoff { opacity: .55; }
+.modrow .modstate { font-size: 10px; letter-spacing: .05em; border-radius: 999px;
+  padding: 2px 8px; flex: 0 0 auto; }
+.modrow .modstate.on { background: rgba(74,222,128,.12); color: #4ade80; }
+.modrow .modstate.off { background: rgba(255,255,255,.06); color: var(--dim); }

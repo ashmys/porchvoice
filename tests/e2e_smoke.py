@@ -494,6 +494,183 @@ async def section_mcp_live() -> None:
         p2.terminate()
 
 
+def section_llm_gguf() -> None:
+    print("[1e] LLM GGUF routing (engine select, custom dir, auto-detect)")
+    import config
+
+    cfg = dict(config.CONFIG_DEFAULTS)
+    cfg.update({"LLM_ENGINE": "gguf"})
+    sel = config.resolve_llm(cfg)
+    check("llm engine gguf managed url",
+          sel["base_url"] == "http://127.0.0.1:8899/v1" and sel["engine"] == "gguf",
+          str(sel))
+    cfg.update({"LLM_ENGINE": "gguf", "LLM_GGUF_SERVER": "http://127.0.0.1:8080/v1"})
+    sel = config.resolve_llm(cfg)
+    check("llm gguf external server", sel["base_url"].endswith(":8080/v1")
+          and sel["source"] == "config", str(sel))
+
+    import tempfile
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        cfg = dict(config.CONFIG_DEFAULTS)
+        cfg.update({"LLM_ENGINE": "", "LLM_GGUF_MODELS_DIR": str(tmpdir),
+                    "LLM_GGUF_MODEL": ""})
+        check("no model -> no gguf autodetect",
+              config.llm_gguf_model_path(cfg) is None)
+        mmproj = tmpdir / "mmproj-x.gguf"
+        mmproj.write_bytes(b"x")
+        check("mmproj files are skipped",
+              config.llm_gguf_model_path(cfg) is None)
+        model = tmpdir / "My-Chat-Q4_K_M.gguf"
+        model.write_bytes(b"y")
+        check("auto-detect picks first chat gguf",
+              config.llm_gguf_model_path(cfg) == model)
+        cfg.update({"LLM_GGUF_MODEL": "does-not-exist.gguf"})
+        check("named-but-missing model -> None",
+              config.llm_gguf_model_path(cfg) is None)
+        cfg.update({"LLM_GGUF_MODEL": "My-Chat-Q4_K_M.gguf"})
+        check("named model found", config.llm_gguf_model_path(cfg) == model)
+        sel = config.resolve_llm(cfg, probe=lambda u, key="", timeout=2.0: False)
+        check("auto resolve skips gguf when server not up",
+              sel["kind"] == "none", str(sel))
+        sel = config.resolve_llm(cfg, probe=lambda u, key="", timeout=2.0: "8899" in u)
+        check("auto resolve uses managed gguf when up",
+              sel["engine"] == "gguf" and sel["source"] == "auto:managed-gguf",
+              str(sel))
+        sel = config.resolve_llm(dict(cfg, LLM_BASE_URL="http://127.0.0.1:1234/v1"),
+                                 probe=lambda u, key="", timeout=2.0: False)
+        check("explicit base_url wins over gguf",
+              sel["source"] == "config" and sel["base_url"].endswith(":1234/v1"),
+              str(sel))
+    finally:
+        mmproj.unlink(missing_ok=True)
+        model.unlink(missing_ok=True)
+        tmpdir.rmdir()
+
+
+def section_setup_preserve() -> None:
+    print("[1f] setup wizard: env preservation + current values as defaults")
+    import tempfile
+
+    import setup_wizard as sw
+
+    old_env = sw.ENV_FILE
+    old_dry = sw.DRY_RUN
+    tmp = Path(tempfile.mkdtemp()) / ".env.local"
+    try:
+        tmp.write_text(
+            "LLM_BASE_URL=http://old:1234/v1\n"
+            "UI_BROWSER=brave\n"
+            "WHISPER_BEAM=3\n",
+            encoding="utf-8")
+        sw.ENV_FILE = tmp
+        sw.DRY_RUN = False
+        existing = sw.read_env()
+        check("read_env picks up existing values",
+              existing.get("LLM_BASE_URL") == "http://old:1234/v1"
+              and existing.get("UI_BROWSER") == "brave")
+        sw.write_env({"PUBLISH_MODE": "wifi"})
+        out = tmp.read_text(encoding="utf-8")
+        check("write_env keeps existing LLM_BASE_URL",
+              "LLM_BASE_URL=http://old:1234/v1" in out)
+        check("write_env keeps unknown keys (UI_BROWSER, WHISPER_BEAM)",
+              "UI_BROWSER=brave" in out and "WHISPER_BEAM=3" in out)
+        check("write_env applies the update", "PUBLISH_MODE=wifi" in out)
+        check("write_env writes commented headers", out.startswith("# PorchVoice"))
+        sw.DRY_RUN = True
+        sw.write_env({"LLM_BASE_URL": "http://new:1/v1"})
+        check("dry-run leaves file untouched",
+              "LLM_BASE_URL=http://old:1234/v1" in tmp.read_text(encoding="utf-8"))
+    finally:
+        sw.ENV_FILE = old_env
+        sw.DRY_RUN = old_dry
+        tmp.unlink(missing_ok=True)
+        tmp.parent.rmdir()
+
+
+async def section_modules_api() -> None:
+    print("[3c] modules + models/llm API (list, select, remove, in-use guard)")
+    import tempfile
+
+    import config
+    import server as srv
+
+    old_dir = config.ROOT
+    old_env = srv.ENV_FILE
+    old_cfg_env = config.ENV_FILE
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        modeldir = tmp / "llm"
+        modeldir.mkdir()
+        envp = tmp / ".env.local"
+        envp.write_text("STT_ENGINE=whisper\n"
+                        "LLM_GGUF_MODELS_DIR=" + str(modeldir) + "\n",
+                        encoding="utf-8")
+        srv.ENV_FILE = envp
+        config.ENV_FILE = envp
+        m1 = modeldir / "Test-Model-Q8_0.gguf"
+        m1.write_bytes(b"z" * 2048)
+
+        runner = await _boot_app("local", free_port())
+        base = "http://127.0.0.1:" + str(runner.addresses[0][1])
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(base + "/api/models/llm") as r:
+                    d = await r.json()
+                    check("models/llm lists detected model",
+                          any(m["name"] == m1.name for m in d["models"]), str(d["models"]))
+                    check("models/llm has presets catalog",
+                          len(d["presets"]) >= 3 and all("repo" in p for p in d["presets"]))
+                async with s.post(base + "/api/models/llm", json={
+                        "action": "select", "name": m1.name}) as r:
+                    d = await r.json()
+                    check("select model ok", r.status == 200 and d.get("ok"), str(d))
+                check("select wrote LLM_ENGINE=gguf",
+                      "LLM_ENGINE=gguf" in envp.read_text(encoding="utf-8"))
+                async with s.post(base + "/api/models/llm", json={
+                        "action": "select", "name": "../escape.gguf"}) as r:
+                    check("select rejects path traversal", r.status == 400)
+                async with s.post(base + "/api/modules/remove",
+                                  json={"id": "llm-gguf"}) as r:
+                    d = await r.json()
+                    check("remove blocked while LLM engine is gguf",
+                          r.status == 400 and "in use" in d.get("message", ""), str(d))
+                envp.write_text("STT_ENGINE=whisper\nLLM_ENGINE=api\n"
+                                "LLM_GGUF_MODELS_DIR=" + str(modeldir) + "\n",
+                                encoding="utf-8")
+                async with s.post(base + "/api/modules/remove",
+                                  json={"id": "llm-gguf"}) as r:
+                    d = await r.json()
+                    check("remove works when engine not gguf",
+                          r.status == 200 and d.get("ok"), str(d))
+                check("model file really gone", not m1.exists())
+                async with s.post(base + "/api/models/llm", json={
+                        "action": "remove", "name": m1.name}) as r:
+                    check("remove of missing file is a clean 400",
+                          r.status == 400, str(r.status))
+                async with s.get(base + "/api/modules") as r:
+                    d = await r.json()
+                    ids = [m["id"] for m in d["modules"]]
+                    check("modules list has packages and files",
+                          "whisper-stt" in ids and "llm-gguf" in ids, str(ids))
+                    check("livekit-server flagged in use",
+                          next(m for m in d["modules"]
+                               if m["id"] == "livekit-server")["in_use"] != "")
+                async with s.post(base + "/api/modules/remove",
+                                  json={"id": "livekit-server"}) as r:
+                    check("livekit-server removal refused", r.status == 400)
+                async with s.post(base + "/api/modules/remove",
+                                  json={"id": "no-such-module"}) as r:
+                    check("unknown module rejected", r.status == 400)
+        finally:
+            await runner.cleanup()
+    finally:
+        srv.ENV_FILE = old_env
+        config.ENV_FILE = old_cfg_env
+        import shutil as _sh
+        _sh.rmtree(tmp, ignore_errors=True)
+
+
 async def main_async() -> None:
     global LK_PORT
     LK_PORT = free_port()
@@ -501,9 +678,12 @@ async def main_async() -> None:
     section_keyvault()
     friendly_llm_error_cases()
     section_env_file()
+    section_llm_gguf()
+    section_setup_preserve()
     section_providers()
     await section_server()
     await section_config_api()
+    await section_modules_api()
     await section_mcp_live()
     section_worker_boot()
 
